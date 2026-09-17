@@ -1,0 +1,103 @@
+mod error
+mod oid
+mod commit
+
+fn contains_hex(arr: [string], h: string) -> bool is
+    let mut i: int = 0
+    while i < arr.len() is
+        if arr[i] == h is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Every commit reachable from `start` (itself included), each visited
+;; exactly once even across a merge's shared history. Order is not
+;; guaranteed — use `log()` for a display-ready newest-first order.
+pub fn walk(git_dir: string, start: oid::Oid) -> error::GitResult<[commit::Commit]> is
+    let mut visited: [string] = []
+    let mut stack: [oid::Oid] = [start]
+    let mut result: [commit::Commit] = []
+
+    while stack.len() > 0 is
+        let last: int = stack.len() - 1
+        let current: oid::Oid = stack[last]
+        stack = stack[0..last]
+
+        if !contains_hex(visited, current.hex()) is
+            visited.push(current.hex())
+            match commit::lookup(git_dir, current) is
+                error::GitResult::Err(e) => return error::GitResult::Err(e)
+                error::GitResult::Ok(c)  => is
+                    result.push(c)
+                    let parents: [oid::Oid] = c.parent_ids()
+                    let mut i: int = 0
+                    while i < parents.len() is
+                        stack.push(parents[i])
+                        i += 1
+                    end
+                end
+            end
+        end
+    end
+
+    return error::GitResult::Ok(result)
+end
+
+;; `git log`-order: newest committer-time first.
+pub fn log(git_dir: string, start: oid::Oid) -> error::GitResult<[commit::Commit]> is
+    match walk(git_dir, start) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(commits) => error::GitResult::Ok(sort_by_time_desc(commits))
+    end
+end
+
+;; Plain insertion sort, newest-first, keyed on committer time — same
+;; "small N, keep it simple" reasoning as `tree.h#`'s entry sort; a
+;; commit history explored one repo at a time is not the place `std ->
+;; sort`'s generic comparator support would pay for its own complexity.
+fn sort_by_time_desc(commits: [commit::Commit]) -> [commit::Commit] is
+    let mut out: [commit::Commit] = commits
+    let n: int = out.len()
+    let mut i: int = 1
+    while i < n is
+        let mut j: int = i
+        while j > 0 && out[j - 1].committer().when() < out[j].committer().when() is
+            let tmp: commit::Commit = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = tmp
+            j -= 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; `git log --oneline`-style one line per commit: "<short-oid> <summary>".
+pub fn format_oneline(commits: [commit::Commit]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < commits.len() is
+        out.push(commits[i].id().short() + " " + commits[i].summary())
+        i += 1
+    end
+    return out
+end
+
+;; Whether `ancestor` is reachable by walking parents starting at
+;; `descendant` — used by `branch.h#`/`porcelain.h#` to decide whether a
+;; merge can fast-forward.
+pub fn is_ancestor(git_dir: string, ancestor: oid::Oid, descendant: oid::Oid) -> error::GitResult<bool> is
+    if ancestor.eq(descendant) is return error::GitResult::Ok(true) end
+    match walk(git_dir, descendant) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(commits) => is
+            let mut i: int = 0
+            while i < commits.len() is
+                if commits[i].id().eq(ancestor) is return error::GitResult::Ok(true) end
+                i += 1
+            end
+            return error::GitResult::Ok(false)
+        end
+    end
+end
