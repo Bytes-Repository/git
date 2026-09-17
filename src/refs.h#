@@ -1,0 +1,205 @@
+mod error
+mod oid
+
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+
+pub enum RefTarget is
+    Direct(oid::Oid)     ;; refs/heads/main -> <sha1>
+    Symbolic(string)     ;; HEAD -> refs/heads/main
+end
+
+pub struct Reference is
+    pub _name:   string  ;; full name, e.g. "refs/heads/main" or "HEAD"
+    pub _target: RefTarget
+end
+
+impl Reference is
+    fn name(self) -> string is return self._name end
+    fn target(self) -> RefTarget is return self._target end
+
+    fn is_direct(self) -> bool is
+        match self._target is
+            RefTarget::Direct(_)   => true
+            RefTarget::Symbolic(_) => false
+        end
+    end
+
+    fn is_symbolic(self) -> bool is return !self.is_direct() end
+
+    ;; The short name Git shows for branches/tags: "refs/heads/main" -> "main".
+    fn shorthand(self) -> string is
+        return shorthand_of(self._name)
+    end
+end
+
+pub fn shorthand_of(full_name: string) -> string is
+    if full_name.starts_with("refs/heads/") is return full_name[11..full_name.len()] end
+    if full_name.starts_with("refs/tags/")  is return full_name[10..full_name.len()] end
+    if full_name.starts_with("refs/remotes/") is return full_name[13..full_name.len()] end
+    return full_name
+end
+
+;; ── Paths ────────────────────────────────────────────────────────────────
+
+pub fn branch_ref_name(branch: string) -> string is return "refs/heads/" + branch end
+pub fn tag_ref_name(tag_name: string)  -> string is return "refs/tags/" + tag_name end
+
+fn ref_path(git_dir: string, name: string) -> string is
+    return path::join(git_dir, name)
+end
+
+;; ── Reading ──────────────────────────────────────────────────────────────
+
+fn parse_ref_content(content: string) -> RefTarget is
+    let trimmed: string = str::trim(content)
+    if trimmed.starts_with("ref: ") is
+        return RefTarget::Symbolic(str::trim(trimmed[5..trimmed.len()]))
+    end
+    let id = oid::from_hex(trimmed)
+    if id != nil is return RefTarget::Direct(id) end
+    return RefTarget::Direct(oid::zero())
+end
+
+;; Read one ref file (not resolved through symbolic indirection — see
+;; `resolve` for that).
+pub fn read(git_dir: string, name: string) -> error::GitResult<Reference> is
+    let p: string = ref_path(git_dir, name)
+    if !fs::exists(p) is
+        return error::GitResult::Err(error::not_found("ref " + name))
+    end
+    let content: string = fs::read(p)
+    return error::GitResult::Ok(Reference { _name: name, _target: parse_ref_content(content) })
+end
+
+;; Follow symbolic refs (HEAD -> refs/heads/main -> <oid>) all the way
+;; down to a concrete `Oid`. Mirrors `Reference::peel_to_commit`'s "give
+;; me the sha1" half in git2 (peeling to an actual object is
+;; `object::read`'s job once you have the id).
+pub fn resolve(git_dir: string, name: string) -> error::GitResult<oid::Oid> is
+    let mut current: string = name
+    let mut hops: int = 0
+    while hops < 10 is
+        match read(git_dir, current) is
+            error::GitResult::Err(e) => return error::GitResult::Err(e)
+            error::GitResult::Ok(r)  => is
+                match r.target() is
+                    RefTarget::Direct(id)     => return error::GitResult::Ok(id)
+                    RefTarget::Symbolic(next) => current = next
+                end
+            end
+        end
+        hops += 1
+    end
+    return error::GitResult::Err(error::corrupt("ref " + name + " has too many levels of indirection"))
+end
+
+pub fn exists(git_dir: string, name: string) -> bool is
+    return fs::exists(ref_path(git_dir, name))
+end
+
+;; ── Writing ──────────────────────────────────────────────────────────────
+
+pub fn write_direct(git_dir: string, name: string, id: oid::Oid) is
+    let p: string = ref_path(git_dir, name)
+    fs::mkdir(path::parent(p))
+    fs::write(p, id.hex() + "\n")
+end
+
+pub fn write_symbolic(git_dir: string, name: string, target: string) is
+    let p: string = ref_path(git_dir, name)
+    fs::mkdir(path::parent(p))
+    fs::write(p, "ref: " + target + "\n")
+end
+
+pub fn delete(git_dir: string, name: string) is
+    let p: string = ref_path(git_dir, name)
+    if fs::exists(p) is fs::remove(p) end
+end
+
+;; ── Listing ──────────────────────────────────────────────────────────────
+
+;; List every ref under a namespace, e.g. `list(git_dir, "refs/heads")`
+;; for branches. Returns full ref names ("refs/heads/main"), sorted.
+pub fn list(git_dir: string, namespace: string) -> [string] is
+    let base: string = path::join(git_dir, namespace)
+    let mut out: [string] = []
+    if !fs::is_dir(base) is return out end
+    let files: [string] = fs::walk(base)
+    let mut i: int = 0
+    while i < files.len() is
+        if fs::is_file(files[i]) is
+            let rel: string = files[i][base.len() + 1..files[i].len()]
+            out.push(namespace + "/" + rel)
+        end
+        i += 1
+    end
+    return sort_strings(out)
+end
+
+fn sort_strings(items: [string]) -> [string] is
+    let mut out: [string] = items
+    let n: int = out.len()
+    let mut i: int = 1
+    while i < n is
+        let mut j: int = i
+        while j > 0 && out[j - 1] > out[j] is
+            let tmp: string = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = tmp
+            j -= 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── HEAD ─────────────────────────────────────────────────────────────────
+
+pub fn head_ref_name() -> string is return "HEAD" end
+
+;; The oid HEAD currently points at (following `refs/heads/<branch>` if
+;; attached). Errors (not just "unborn branch") propagate — an empty
+;; repo with no commits yet resolves HEAD's *symbolic* target fine but
+;; fails to resolve an oid; callers that need to special-case "no
+;; commits yet" should catch `ErrorKind::NotFound` from this and treat
+;; it as "there is no history yet", same as git2's `head_unborn`.
+pub fn head_oid(git_dir: string) -> error::GitResult<oid::Oid> is
+    return resolve(git_dir, head_ref_name())
+end
+
+;; Whether HEAD is "detached" (points directly at a commit rather than
+;; at a branch ref).
+pub fn head_is_detached(git_dir: string) -> error::GitResult<bool> is
+    match read(git_dir, head_ref_name()) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(r)  => is
+            match r.target() is
+                RefTarget::Direct(_)   => error::GitResult::Ok(true)
+                RefTarget::Symbolic(_) => error::GitResult::Ok(false)
+            end
+        end
+    end
+end
+
+;; The branch name HEAD is attached to, e.g. "main" — nil if detached.
+pub fn head_branch(git_dir: string) -> string? is
+    match read(git_dir, head_ref_name()) is
+        error::GitResult::Err(_) => nil
+        error::GitResult::Ok(r)  => is
+            match r.target() is
+                RefTarget::Symbolic(target) => shorthand_of(target)
+                RefTarget::Direct(_)        => nil
+            end
+        end
+    end
+end
+
+pub fn set_head_to_branch(git_dir: string, branch: string) is
+    write_symbolic(git_dir, head_ref_name(), branch_ref_name(branch))
+end
+
+pub fn set_head_detached(git_dir: string, id: oid::Oid) is
+    write_direct(git_dir, head_ref_name(), id)
+end
