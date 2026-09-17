@@ -1,0 +1,306 @@
+mod error
+mod oid
+mod object
+mod tree
+mod blob
+
+use "std -> strings" from "str"
+
+;; ── Line diff (Myers-lite: LCS-based) ───────────────────────────────────
+
+pub enum LineOrigin is
+    Context   ;; unchanged line, shown for reference
+    Addition
+    Deletion
+end
+
+pub struct DiffLine is
+    pub _origin:  LineOrigin
+    pub _content: string
+end
+
+impl DiffLine is
+    fn origin(self)  -> LineOrigin is return self._origin end
+    fn content(self) -> string     is return self._content end
+
+    fn prefix(self) -> string is
+        match self._origin is
+            LineOrigin::Context  => " "
+            LineOrigin::Addition => "+"
+            LineOrigin::Deletion => "-"
+        end
+    end
+
+    fn to_line(self) -> string is
+        return self.prefix() + self._content
+    end
+end
+
+fn split_lines(s: string) -> [string] is
+    if s.len() == 0 is return [] end
+    return str::split(s, "\n")
+end
+
+;; Longest-common-subsequence line diff between two texts. O(n*m) time
+;; and space — fine for the file sizes a from-scratch, string-oriented
+;; language like H# reasonably diffs; not meant for multi-megabyte
+;; blobs (real Git switches algorithms well before that size too).
+pub fn diff_text(old_text: string, new_text: string) -> [DiffLine] is
+    let a: [string] = split_lines(old_text)
+    let b: [string] = split_lines(new_text)
+    let n: int = a.len()
+    let m: int = b.len()
+
+    ;; lcs[i][j] = length of LCS of a[i..n) and b[j..m)
+    let mut lcs: [[int]] = new_grid(n + 1, m + 1)
+    let mut i: int = n - 1
+    while i >= 0 is
+        let mut j: int = m - 1
+        while j >= 0 is
+            if a[i] == b[j] is
+                lcs[i][j] = lcs[i + 1][j + 1] + 1
+            else is
+                let up: int = lcs[i + 1][j]
+                let left: int = lcs[i][j + 1]
+                if up >= left is lcs[i][j] = up else is lcs[i][j] = left end
+            end
+            j -= 1
+        end
+        i -= 1
+    end
+
+    let mut out: [DiffLine] = []
+    let mut ii: int = 0
+    let mut jj: int = 0
+    while ii < n && jj < m is
+        if a[ii] == b[jj] is
+            out.push(DiffLine { _origin: LineOrigin::Context, _content: a[ii] })
+            ii += 1
+            jj += 1
+        else is
+            if lcs[ii + 1][jj] >= lcs[ii][jj + 1] is
+                out.push(DiffLine { _origin: LineOrigin::Deletion, _content: a[ii] })
+                ii += 1
+            else is
+                out.push(DiffLine { _origin: LineOrigin::Addition, _content: b[jj] })
+                jj += 1
+            end
+        end
+    end
+    while ii < n is
+        out.push(DiffLine { _origin: LineOrigin::Deletion, _content: a[ii] })
+        ii += 1
+    end
+    while jj < m is
+        out.push(DiffLine { _origin: LineOrigin::Addition, _content: b[jj] })
+        jj += 1
+    end
+    return out
+end
+
+fn new_grid(rows: int, cols: int) -> [[int]] is
+    let mut grid: [[int]] = []
+    let mut r: int = 0
+    while r < rows is
+        let mut row: [int] = []
+        let mut c: int = 0
+        while c < cols is
+            row.push(0)
+            c += 1
+        end
+        grid.push(row)
+        r += 1
+    end
+    return grid
+end
+
+;; Render diff lines the familiar unified-diff way, with a "--- / +++"
+;; header. Not a byte-exact `git diff` patch (no @@ hunk headers/context
+;; windowing) — a full readable text rendering, same spirit as
+;; `git diff --no-color` without hunk collapsing.
+pub fn format_unified(path_a: string, path_b: string, lines: [DiffLine]) -> string is
+    let mut out: string = "--- " + path_a + "\n+++ " + path_b + "\n"
+    let mut i: int = 0
+    while i < lines.len() is
+        out = out + lines[i].to_line() + "\n"
+        i += 1
+    end
+    return out
+end
+
+pub fn diff_blobs(git_dir: string, old_id: oid::Oid, new_id: oid::Oid) -> error::GitResult<[DiffLine]> is
+    match blob::lookup(git_dir, old_id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(old_blob) => is
+            match blob::lookup(git_dir, new_id) is
+                error::GitResult::Err(e2) => error::GitResult::Err(e2)
+                error::GitResult::Ok(new_blob) => error::GitResult::Ok(diff_text(old_blob.content(), new_blob.content()))
+            end
+        end
+    end
+end
+
+;; ── Tree diff (per-file status, one level of recursion at a time) ──────
+
+pub enum FileStatus is
+    Added
+    Deleted
+    Modified
+    Unchanged
+end
+
+pub fn status_name(s: FileStatus) -> string is
+    match s is
+        FileStatus::Added     => "added"
+        FileStatus::Deleted   => "deleted"
+        FileStatus::Modified  => "modified"
+        FileStatus::Unchanged => "unchanged"
+    end
+end
+
+pub struct FileDelta is
+    pub _path:   string
+    pub _status: FileStatus
+    pub _old_id: oid::Oid
+    pub _new_id: oid::Oid
+end
+
+impl FileDelta is
+    fn path(self)   -> string     is return self._path end
+    fn status(self) -> FileStatus is return self._status end
+    fn old_id(self) -> oid::Oid   is return self._old_id end
+    fn new_id(self) -> oid::Oid   is return self._new_id end
+end
+
+;; Recursively compare two trees, returning one `FileDelta` per changed
+;; blob path (added/deleted/modified). Mirrors `Repository::diff_tree_to_tree()`
+;; at a "which files changed" granularity — pair with `diff_blobs()` for
+;; per-file line diffs.
+pub fn diff_trees(git_dir: string, old_tree: oid::Oid, new_tree: oid::Oid) -> error::GitResult<[FileDelta]> is
+    let mut acc: [FileDelta] = []
+    return diff_trees_prefix(git_dir, old_tree, new_tree, "", acc)
+end
+
+fn diff_trees_prefix(git_dir: string, old_tree: oid::Oid, new_tree: oid::Oid,
+                      prefix: string, acc: [FileDelta]) -> error::GitResult<[FileDelta]> is
+    let mut old_entries: [tree::TreeEntry] = []
+    if !old_tree.is_zero() is
+        match tree::lookup(git_dir, old_tree) is
+            error::GitResult::Err(e) => return error::GitResult::Err(e)
+            error::GitResult::Ok(t)  => old_entries = t.entries()
+        end
+    end
+    let mut new_entries: [tree::TreeEntry] = []
+    if !new_tree.is_zero() is
+        match tree::lookup(git_dir, new_tree) is
+            error::GitResult::Err(e) => return error::GitResult::Err(e)
+            error::GitResult::Ok(t)  => new_entries = t.entries()
+        end
+    end
+
+    let mut out: [FileDelta] = acc
+    let mut names: [string] = []
+    let mut oi: int = 0
+    while oi < old_entries.len() is
+        if !contains_name(names, old_entries[oi].name()) is names.push(old_entries[oi].name()) end
+        oi += 1
+    end
+    let mut ni: int = 0
+    while ni < new_entries.len() is
+        if !contains_name(names, new_entries[ni].name()) is names.push(new_entries[ni].name()) end
+        ni += 1
+    end
+
+    let mut k: int = 0
+    while k < names.len() is
+        let name: string = names[k]
+        let old_e = find_entry(old_entries, name)
+        let new_e = find_entry(new_entries, name)
+        let full_path: string = prefix + name
+
+        if old_e == nil && new_e != nil is
+            out = expand_added(git_dir, new_e, full_path, out)
+        else if old_e != nil && new_e == nil is
+            out = expand_deleted(git_dir, old_e, full_path, out)
+        else if old_e != nil && new_e != nil is
+            if old_e.is_dir() || new_e.is_dir() is
+                let old_sub = subtree_id(old_e)
+                let new_sub = subtree_id(new_e)
+                match diff_trees_prefix(git_dir, old_sub, new_sub, full_path + "/", out) is
+                    error::GitResult::Err(e) => return error::GitResult::Err(e)
+                    error::GitResult::Ok(nested) => out = nested
+                end
+            else if !old_e.id().eq(new_e.id()) is
+                out.push(FileDelta { _path: full_path, _status: FileStatus::Modified,
+                                      _old_id: old_e.id(), _new_id: new_e.id() })
+            end
+        end
+        k += 1
+    end
+    return error::GitResult::Ok(out)
+end
+
+fn subtree_id(e: tree::TreeEntry) -> oid::Oid is
+    if e.is_dir() is return e.id() end
+    return oid::zero()
+end
+
+fn expand_added(git_dir: string, e: tree::TreeEntry, full_path: string, acc: [FileDelta]) -> [FileDelta] is
+    if e.is_dir() is
+        match tree::lookup(git_dir, e.id()) is
+            error::GitResult::Ok(t) => is
+                let mut out: [FileDelta] = acc
+                let entries: [tree::TreeEntry] = t.entries()
+                let mut i: int = 0
+                while i < entries.len() is
+                    out = expand_added(git_dir, entries[i], full_path + "/" + entries[i].name(), out)
+                    i += 1
+                end
+                return out
+            end
+            error::GitResult::Err(_) => return acc
+        end
+    end
+    let mut out: [FileDelta] = acc
+    out.push(FileDelta { _path: full_path, _status: FileStatus::Added, _old_id: oid::zero(), _new_id: e.id() })
+    return out
+end
+
+fn expand_deleted(git_dir: string, e: tree::TreeEntry, full_path: string, acc: [FileDelta]) -> [FileDelta] is
+    if e.is_dir() is
+        match tree::lookup(git_dir, e.id()) is
+            error::GitResult::Ok(t) => is
+                let mut out: [FileDelta] = acc
+                let entries: [tree::TreeEntry] = t.entries()
+                let mut i: int = 0
+                while i < entries.len() is
+                    out = expand_deleted(git_dir, entries[i], full_path + "/" + entries[i].name(), out)
+                    i += 1
+                end
+                return out
+            end
+            error::GitResult::Err(_) => return acc
+        end
+    end
+    let mut out: [FileDelta] = acc
+    out.push(FileDelta { _path: full_path, _status: FileStatus::Deleted, _old_id: e.id(), _new_id: oid::zero() })
+    return out
+end
+
+fn contains_name(names: [string], n: string) -> bool is
+    let mut i: int = 0
+    while i < names.len() is
+        if names[i] == n is return true end
+        i += 1
+    end
+    return false
+end
+
+fn find_entry(entries: [tree::TreeEntry], name: string) -> tree::TreeEntry? is
+    let mut i: int = 0
+    while i < entries.len() is
+        if entries[i].name() == name is return entries[i] end
+        i += 1
+    end
+    return nil
+end
