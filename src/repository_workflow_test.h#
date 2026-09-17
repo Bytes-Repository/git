@@ -1,0 +1,225 @@
+use "std -> test" from "test"
+use "std -> fs"   from "fs"
+
+mod error
+mod oid
+mod object
+mod signature
+mod repository
+mod index
+mod branch
+mod checkout
+mod porcelain
+mod status
+mod diff
+mod reset
+mod refs
+mod commit
+
+fn fresh_dir(name: string) -> string is
+    let d: string = "/tmp/hgit_test_" + name
+    if fs::exists(d) is fs::rmdir_all(d) end
+    return d
+end
+
+fn test_signature() -> signature::Signature is
+    return signature::Signature::new("Test User", "test@example.com", 1700000000, 0)
+end
+
+#[test]
+fn test_init_creates_layout() is
+    let dir = fresh_dir("wf_init")
+    let result = repository::init(dir, false)
+    assert_true(error::is_ok(result))
+    match result is
+        error::GitResult::Ok(repo) => is
+            assert_true(fs::is_dir(repo.path()))
+            assert_true(fs::is_dir(dir + "/.git/objects"))
+            assert_true(fs::is_dir(dir + "/.git/refs/heads"))
+            assert_eq(repo.head_branch(), "main")
+            assert_false(repo.is_bare())
+        end
+        error::GitResult::Err(_) => fail("expected Ok")
+    end
+end
+
+#[test]
+fn test_init_twice_fails() is
+    let dir = fresh_dir("wf_init_twice")
+    let first = repository::init(dir, false)
+    assert_true(error::is_ok(first))
+    let second = repository::init(dir, false)
+    assert_true(error::is_err(second))
+end
+
+#[test]
+fn test_open_discovers_existing_repo() is
+    let dir = fresh_dir("wf_open")
+    repository::init(dir, false)
+    let opened = repository::open(dir)
+    assert_true(error::is_ok(opened))
+end
+
+#[test]
+fn test_commit_all_workflow() is
+    let dir = fresh_dir("wf_commit_all")
+    let init_result = repository::init(dir, false)
+
+    match init_result is
+        error::GitResult::Ok(repo) => is
+            fs::write(dir + "/README.md", "# Hello\n")
+            fs::mkdir(dir + "/src")
+            fs::write(dir + "/src/main.txt", "print hello")
+
+            let sig = test_signature()
+            let commit_result = porcelain::commit_all(repo, "Initial commit", sig)
+            assert_true(error::is_ok(commit_result))
+
+            let head = repo.head()
+            assert_true(error::is_ok(head))
+
+            let clean = porcelain::is_clean(repo)
+            assert_true(error::is_ok(clean))
+            match clean is
+                error::GitResult::Ok(is_clean_val) => assert_true(is_clean_val)
+                error::GitResult::Err(_) => fail("expected Ok")
+            end
+        end
+        error::GitResult::Err(_) => fail("expected Ok on init")
+    end
+end
+
+#[test]
+fn test_status_detects_untracked_and_modified() is
+    let dir = fresh_dir("wf_status")
+    match repository::init(dir, false) is
+        error::GitResult::Ok(repo) => is
+            fs::write(dir + "/a.txt", "version 1")
+            porcelain::commit_all(repo, "first", test_signature())
+
+            fs::write(dir + "/a.txt", "version 2")
+            fs::write(dir + "/b.txt", "new file")
+
+            match status::status(repo.path(), repo.workdir()) is
+                error::GitResult::Ok(entries) => is
+                    assert_false(status::is_clean(entries))
+                end
+                error::GitResult::Err(_) => fail("expected Ok")
+            end
+        end
+        error::GitResult::Err(_) => fail("expected Ok on init")
+    end
+end
+
+#[test]
+fn test_branch_and_checkout() is
+    let dir = fresh_dir("wf_branch")
+    match repository::init(dir, false) is
+        error::GitResult::Ok(repo) => is
+            fs::write(dir + "/file.txt", "on main")
+            let c1 = porcelain::commit_all(repo, "on main", test_signature())
+
+            match c1 is
+                error::GitResult::Ok(main_commit) => is
+                    let created = branch::create(repo.path(), "feature", main_commit)
+                    assert_true(error::is_ok(created))
+                    assert_true(branch::exists(repo.path(), "feature"))
+
+                    let co = checkout::checkout_branch(repo.path(), repo.workdir(), "feature")
+                    assert_true(error::is_ok(co))
+                    assert_eq(refs::head_branch(repo.path()), "feature")
+
+                    let branches = branch::list(repo.path())
+                    assert_eq(branches.len(), 2)
+                end
+                error::GitResult::Err(_) => fail("expected Ok on commit")
+            end
+        end
+        error::GitResult::Err(_) => fail("expected Ok on init")
+    end
+end
+
+#[test]
+fn test_log_shows_history_newest_first() is
+    let dir = fresh_dir("wf_log")
+    match repository::init(dir, false) is
+        error::GitResult::Ok(repo) => is
+            fs::write(dir + "/f.txt", "1")
+            porcelain::commit_all(repo, "commit one", test_signature())
+            fs::write(dir + "/f.txt", "2")
+            porcelain::commit_all(repo, "commit two", test_signature())
+
+            match porcelain::log(repo) is
+                error::GitResult::Ok(lines) => is
+                    assert_eq(lines.len(), 2)
+                    assert_true(lines[0].contains("commit two"))
+                    assert_true(lines[1].contains("commit one"))
+                end
+                error::GitResult::Err(_) => fail("expected Ok")
+            end
+        end
+        error::GitResult::Err(_) => fail("expected Ok on init")
+    end
+end
+
+#[test]
+fn test_reset_hard_discards_changes() is
+    let dir = fresh_dir("wf_reset")
+    match repository::init(dir, false) is
+        error::GitResult::Ok(repo) => is
+            fs::write(dir + "/f.txt", "committed")
+            let c1 = porcelain::commit_all(repo, "commit", test_signature())
+
+            fs::write(dir + "/f.txt", "uncommitted change")
+
+            match c1 is
+                error::GitResult::Ok(commit_id) => is
+                    let r = reset::reset(repo.path(), repo.workdir(), commit_id, reset::ResetMode::Hard)
+                    assert_true(error::is_ok(r))
+                    assert_eq(fs::read(dir + "/f.txt"), "committed")
+                end
+                error::GitResult::Err(_) => fail("expected Ok on commit")
+            end
+        end
+        error::GitResult::Err(_) => fail("expected Ok on init")
+    end
+end
+
+#[test]
+fn test_diff_trees_reports_changes() is
+    let dir = fresh_dir("wf_diff")
+    match repository::init(dir, false) is
+        error::GitResult::Ok(repo) => is
+            fs::write(dir + "/f.txt", "line one\nline two\n")
+            let c1 = porcelain::commit_all(repo, "first", test_signature())
+            fs::write(dir + "/f.txt", "line one\nline two changed\n")
+            fs::write(dir + "/g.txt", "brand new")
+            let c2 = porcelain::commit_all(repo, "second", test_signature())
+
+            match c1 is
+                error::GitResult::Ok(id1) => is
+                    match c2 is
+                        error::GitResult::Ok(id2) => is
+                            match diff::diff_trees(repo.path(), commit_tree(repo, id1), commit_tree(repo, id2)) is
+                                error::GitResult::Ok(deltas) => is
+                                    assert_true(deltas.len() >= 2)
+                                end
+                                error::GitResult::Err(_) => fail("expected Ok")
+                            end
+                        end
+                        error::GitResult::Err(_) => fail("expected Ok on second commit")
+                    end
+                end
+                error::GitResult::Err(_) => fail("expected Ok on first commit")
+            end
+        end
+        error::GitResult::Err(_) => fail("expected Ok on init")
+    end
+end
+
+fn commit_tree(repo: repository::Repository, id: oid::Oid) -> oid::Oid is
+    match commit::lookup(repo.path(), id) is
+        error::GitResult::Ok(c) => c.tree_id()
+        error::GitResult::Err(_) => oid::zero()
+    end
+end
