@@ -1,0 +1,164 @@
+mod error
+
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+
+pub struct ConfigEntry is
+    pub _section:    string
+    pub _subsection: string  ;; "" if none
+    pub _key:        string
+    pub _value:      string
+end
+
+impl ConfigEntry is
+    fn section(self)    -> string is return self._section end
+    fn subsection(self) -> string is return self._subsection end
+    fn key(self)         -> string is return self._key end
+    fn value(self)        -> string is return self._value end
+end
+
+pub struct Config is
+    pub _entries: [ConfigEntry]
+end
+
+impl Config is
+    fn entries(self) -> [ConfigEntry] is return self._entries end
+
+    ;; `get("core", "bare")` / `get("remote.origin", "url")`-style
+    ;; lookup: pass "section.subsection" joined with "." for a
+    ;; subsectioned key, matching `git config core.bare` /
+    ;; `git config remote.origin.url` command-line spelling.
+    fn get(self, dotted_key: string) -> string? is
+        let parts: [string] = str::split(dotted_key, ".")
+        if parts.len() < 2 is return nil end
+        let key: string = parts[parts.len() - 1]
+        let mut section: string = parts[0]
+        let mut subsection: string = ""
+        if parts.len() > 2 is
+            let mut mid: [string] = []
+            let mut i: int = 1
+            while i < parts.len() - 1 is
+                mid.push(parts[i])
+                i += 1
+            end
+            subsection = str::join(mid, ".")
+        end
+
+        let mut i: int = 0
+        while i < self._entries.len() is
+            let e: ConfigEntry = self._entries[i]
+            if e.section() == section && e.subsection() == subsection && e.key() == key is
+                return e.value()
+            end
+            i += 1
+        end
+        return nil
+    end
+end
+
+fn config_path(git_dir: string) -> string is
+    return path::join(git_dir, "config")
+end
+
+fn parse_section_header(line: string) -> [string] is
+    ;; line looks like `[core]` or `[remote "origin"]`
+    let inner: string = str::trim(line[1..line.len() - 1])
+    let q1: int = str::index_of(inner, "\"")
+    if q1 < 0 is
+        return [str::trim(inner), ""]
+    end
+    let section: string = str::trim(inner[0..q1])
+    let rest: string = inner[q1 + 1..inner.len()]
+    let q2: int = str::index_of(rest, "\"")
+    if q2 < 0 is return [section, ""] end
+    return [section, rest[0..q2]]
+end
+
+pub fn read(git_dir: string) -> Config is
+    let p: string = config_path(git_dir)
+    let mut entries: [ConfigEntry] = []
+    if !fs::exists(p) is return Config { _entries: entries } end
+
+    let lines: [string] = str::split(fs::read(p), "\n")
+    let mut section: string = ""
+    let mut subsection: string = ""
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = str::trim(lines[i])
+        if line.len() > 0 && !line.starts_with("#") && !line.starts_with(";") is
+            if line.starts_with("[") is
+                let parsed: [string] = parse_section_header(line)
+                section = parsed[0]
+                subsection = parsed[1]
+            else is
+                let eq: int = str::index_of(line, "=")
+                if eq > 0 is
+                    let key: string = str::trim(line[0..eq])
+                    let value: string = str::trim(line[eq + 1..line.len()])
+                    entries.push(ConfigEntry { _section: section, _subsection: subsection, _key: key, _value: value })
+                end
+            end
+        end
+        i += 1
+    end
+    return Config { _entries: entries }
+end
+
+pub fn set(git_dir: string, section: string, subsection: string, key: string, value: string) is
+    let mut cfg: Config = read(git_dir)
+    let mut entries: [ConfigEntry] = cfg.entries()
+    let mut i: int = 0
+    let mut found: bool = false
+    while i < entries.len() is
+        if entries[i].section() == section && entries[i].subsection() == subsection && entries[i].key() == key is
+            entries[i] = ConfigEntry { _section: section, _subsection: subsection, _key: key, _value: value }
+            found = true
+        end
+        i += 1
+    end
+    if !found is
+        entries.push(ConfigEntry { _section: section, _subsection: subsection, _key: key, _value: value })
+    end
+    write(git_dir, Config { _entries: entries })
+end
+
+pub fn write(git_dir: string, cfg: Config) is
+    let entries: [ConfigEntry] = cfg.entries()
+    let mut sections: [string] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let header: string = section_key(entries[i].section(), entries[i].subsection())
+        if !contains_str(sections, header) is sections.push(header) end
+        i += 1
+    end
+
+    let mut out: string = ""
+    let mut s: int = 0
+    while s < sections.len() is
+        out = out + "[" + sections[s] + "]\n"
+        let mut e: int = 0
+        while e < entries.len() is
+            if section_key(entries[e].section(), entries[e].subsection()) == sections[s] is
+                out = out + "\t" + entries[e].key() + " = " + entries[e].value() + "\n"
+            end
+            e += 1
+        end
+        s += 1
+    end
+    fs::write(config_path(git_dir), out)
+end
+
+fn section_key(section: string, subsection: string) -> string is
+    if subsection.len() == 0 is return section end
+    return section + " \"" + subsection + "\""
+end
+
+fn contains_str(arr: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < arr.len() is
+        if arr[i] == v is return true end
+        i += 1
+    end
+    return false
+end
