@@ -1,0 +1,53 @@
+use "std -> test" from "test"
+
+mod oid
+
+#[test]
+fn test_hash_is_deterministic() is
+    let a = oid::hash("blob 5\nhello")
+    let b = oid::hash("blob 5\nhello")
+    assert_eq(a.hex(), b.hex())
+    assert_eq(a.hex().len(), 40)
+end
+
+#[test]
+fn test_hash_differs_for_different_content() is
+    let a = oid::hash("blob 5\nhello")
+    let b = oid::hash("blob 5\nworld")
+    assert_ne(a.hex(), b.hex())
+end
+
+#[test]
+fn test_zero_is_zero() is
+    assert_true(oid::zero().is_zero())
+    assert_false(oid::hash("x").is_zero())
+end
+
+#[test]
+fn test_short() is
+    let id = oid::Oid::new("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    assert_eq(id.short(), "da39a3e")
+    assert_eq(id.short_len(4), "da39")
+end
+
+#[test]
+fn test_from_hex_valid() is
+    let parsed = oid::from_hex("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709")
+    assert_not_nil(parsed)
+    assert_eq(parsed.hex(), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+end
+
+#[test]
+fn test_from_hex_invalid() is
+    assert_nil(oid::from_hex("not-a-valid-oid"))
+    assert_nil(oid::from_hex("abc"))
+end
+
+#[test]
+fn test_eq() is
+    let a = oid::Oid::new("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    let b = oid::Oid::new("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+    let c = oid::hash("something else")
+    assert_true(a.eq(b))
+    assert_false(a.eq(c))
+end
