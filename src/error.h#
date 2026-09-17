@@ -1,0 +1,118 @@
+pub enum ErrorKind is
+    NotFound      ;; object / ref / path / branch does not exist
+    InvalidArg    ;; caller passed something malformed (bad oid, bad path, ...)
+    Corrupt       ;; on-disk data didn't parse the way hgit's own format expects
+    Exists        ;; something hgit was asked to create already exists
+    IoError       ;; underlying fs/std -> fs call failed
+    Conflict      ;; e.g. non-fast-forward merge, dirty checkout
+    Unsupported   ;; deliberately out of scope (see README "Design notes")
+    Generic
+end
+
+pub fn kind_name(k: ErrorKind) -> string is
+    match k is
+        ErrorKind::NotFound    => "not-found"
+        ErrorKind::InvalidArg  => "invalid-argument"
+        ErrorKind::Corrupt     => "corrupt"
+        ErrorKind::Exists      => "already-exists"
+        ErrorKind::IoError     => "io-error"
+        ErrorKind::Conflict    => "conflict"
+        ErrorKind::Unsupported => "unsupported"
+        ErrorKind::Generic     => "error"
+    end
+end
+
+;; ── GitError ─────────────────────────────────────────────────────────────
+
+pub struct GitError is
+    pub _kind:    ErrorKind
+    pub _message: string
+end
+
+impl GitError is
+    fn new(kind: ErrorKind, message: string) -> GitError is
+        return GitError { _kind: kind, _message: message }
+    end
+
+    fn kind(self) -> ErrorKind is return self._kind end
+    fn message(self) -> string is return self._message end
+
+    fn to_string(self) -> string is
+        return kind_name(self._kind) + ": " + self._message
+    end
+end
+
+;; Convenience constructors — mirrors the handful of error "shapes" every
+;; caller of a git library actually needs to branch on.
+pub fn not_found(what: string) -> GitError is
+    return GitError::new(ErrorKind::NotFound, what + " not found")
+end
+
+pub fn invalid(msg: string) -> GitError is
+    return GitError::new(ErrorKind::InvalidArg, msg)
+end
+
+pub fn corrupt(msg: string) -> GitError is
+    return GitError::new(ErrorKind::Corrupt, msg)
+end
+
+pub fn exists(what: string) -> GitError is
+    return GitError::new(ErrorKind::Exists, what + " already exists")
+end
+
+pub fn io_error(msg: string) -> GitError is
+    return GitError::new(ErrorKind::IoError, msg)
+end
+
+pub fn conflict(msg: string) -> GitError is
+    return GitError::new(ErrorKind::Conflict, msg)
+end
+
+pub fn unsupported(msg: string) -> GitError is
+    return GitError::new(ErrorKind::Unsupported, msg)
+end
+
+pub fn generic(msg: string) -> GitError is
+    return GitError::new(ErrorKind::Generic, msg)
+end
+
+;; ── GitResult<T> ─────────────────────────────────────────────────────────
+;;
+;; Same shape as Rust's `Result<T, E>` (with `E` fixed to `GitError`), and
+;; the same shape H#'s own showcase.h# demonstrates working for `Maybe<T>`.
+;; Pattern-match it at the call site:
+;;
+;;   match repository::open(".") is
+;;       GitResult::Ok(repo)  => ...
+;;       GitResult::Err(e)    => write("error: " + e.to_string())
+;;   end
+
+pub enum GitResult<T> is
+    Ok(T)
+    Err(GitError)
+end
+
+;; Free functions rather than `impl` methods on the generic enum itself —
+;; keeps this to the exact generic shape (`enum Foo<T> is ... end` + a
+;; `match` at the use site) the H# showcase already demonstrates working,
+;; instead of layering a generic `impl` block on top that nothing in the
+;; upstream compiler/stdlib exercises yet.
+pub fn is_ok<T>(r: GitResult<T>) -> bool is
+    match r is
+        GitResult::Ok(_)  => true
+        GitResult::Err(_) => false
+    end
+end
+
+pub fn is_err<T>(r: GitResult<T>) -> bool is
+    return !is_ok(r)
+end
+
+;; Extract the error out of a `GitResult`, if any — useful when a caller
+;; already branched on `is_err` via `if` and just wants the message.
+pub fn unwrap_err<T>(r: GitResult<T>) -> GitError is
+    match r is
+        GitResult::Err(e) => e
+        GitResult::Ok(_)  => GitError::new(ErrorKind::Generic, "unwrap_err called on GitResult::Ok")
+    end
+end
