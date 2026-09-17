@@ -1,0 +1,46 @@
+mod error
+mod oid
+mod object
+
+;; A thin, typed wrapper around `object::RawObject` for the `Blob` case —
+;; keeps callers from having to re-check `.kind()` after every read.
+pub struct Blob is
+    pub _oid:     oid::Oid
+    pub _content: string
+end
+
+impl Blob is
+    fn id(self)      -> oid::Oid is return self._oid end
+    fn content(self)  -> string  is return self._content end
+    fn size(self)     -> int     is return self._content.len() end
+
+    ;; Best-effort "is this binary" check, same heuristic `git diff` uses
+    ;; internally (a NUL byte anywhere in the first chunk means binary).
+    fn is_binary(self) -> bool is
+        return self._content.contains("\x00")
+    end
+end
+
+;; Hash `content` as a blob without writing it — mirrors `git hash-object`.
+pub fn hash(content: string) -> oid::Oid is
+    return object::hash(object::ObjectType::Blob, content)
+end
+
+;; Write `content` as a blob object, returning its id — mirrors
+;; `git hash-object -w` / `Repository::blob()` in git2.
+pub fn create(git_dir: string, content: string) -> oid::Oid is
+    return object::write(git_dir, object::ObjectType::Blob, content)
+end
+
+;; Read a blob back by id.
+pub fn lookup(git_dir: string, id: oid::Oid) -> error::GitResult<Blob> is
+    match object::read(git_dir, id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(raw) => is
+            if !object::type_eq(raw.kind(), object::ObjectType::Blob) is
+                return error::GitResult::Err(error::invalid(id.hex() + " is not a blob"))
+            end
+            return error::GitResult::Ok(Blob { _oid: raw.id(), _content: raw.data() })
+        end
+    end
+end
