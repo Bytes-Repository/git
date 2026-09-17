@@ -1,0 +1,154 @@
+mod error
+mod oid
+mod object
+mod signature
+
+use "std -> strings" from "str"
+
+pub struct Commit is
+    pub _oid:       oid::Oid
+    pub _tree:      oid::Oid
+    pub _parents:   [oid::Oid]
+    pub _author:    signature::Signature
+    pub _committer: signature::Signature
+    pub _message:   string
+end
+
+impl Commit is
+    fn id(self)        -> oid::Oid              is return self._oid end
+    fn tree_id(self)   -> oid::Oid               is return self._tree end
+    fn parent_ids(self) -> [oid::Oid]            is return self._parents end
+    fn parent_count(self) -> int                 is return self._parents.len() end
+    fn is_root(self)   -> bool                   is return self._parents.len() == 0 end
+    fn is_merge(self)  -> bool                   is return self._parents.len() > 1 end
+    fn author(self)    -> signature::Signature   is return self._author end
+    fn committer(self) -> signature::Signature   is return self._committer end
+    fn message(self)   -> string                 is return self._message end
+
+    ;; First line of the message — what `git log --oneline` shows.
+    fn summary(self) -> string is
+        let nl: int = str::index_of(self._message, "\n")
+        if nl < 0 is return self._message end
+        return self._message[0..nl]
+    end
+
+    fn parent_id(self, n: int) -> oid::Oid? is
+        if n < 0 || n >= self._parents.len() is return nil end
+        return self._parents[n]
+    end
+end
+
+;; ── Serialization ────────────────────────────────────────────────────────
+
+fn serialize(tree: oid::Oid, parents: [oid::Oid], author: signature::Signature,
+             committer: signature::Signature, message: string) -> string is
+    let mut out: string = "tree " + tree.hex() + "\n"
+    let mut i: int = 0
+    while i < parents.len() is
+        out = out + "parent " + parents[i].hex() + "\n"
+        i += 1
+    end
+    out = out + "author " + author.to_line() + "\n"
+    out = out + "committer " + committer.to_line() + "\n"
+    out = out + "\n" + message
+    return out
+end
+
+pub fn parse(data: string) -> error::GitResult<Commit> is
+    let lines: [string] = str::split(data, "\n")
+
+    let mut tree: oid::Oid = oid::zero()
+    let mut have_tree: bool = false
+    let mut parents: [oid::Oid] = []
+    let mut author: signature::Signature = signature::Signature::now("", "")
+    let mut have_author: bool = false
+    let mut committer: signature::Signature = signature::Signature::now("", "")
+    let mut have_committer: bool = false
+
+    let mut i: int = 0
+    let mut header_lines: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        if line.len() == 0 is
+            header_lines = i + 1
+            i = lines.len()
+        else is
+            if line.len() > 5 && line[0..5] == "tree " is
+                let t = oid::from_hex(line[5..line.len()])
+                if t != nil is
+                    tree = t
+                    have_tree = true
+                end
+            else if line.len() > 7 && line[0..7] == "parent " is
+                let p = oid::from_hex(line[7..line.len()])
+                if p != nil is parents.push(p) end
+            else if line.len() > 7 && line[0..7] == "author " is
+                let s = signature::parse_line(line[7..line.len()])
+                if s != nil is
+                    author = s
+                    have_author = true
+                end
+            else if line.len() > 10 && line[0..10] == "committer " is
+                let s = signature::parse_line(line[10..line.len()])
+                if s != nil is
+                    committer = s
+                    have_committer = true
+                end
+            end
+            i += 1
+        end
+    end
+
+    if !have_tree || !have_author || !have_committer is
+        return error::GitResult::Err(error::corrupt("commit is missing tree/author/committer"))
+    end
+
+    let mut message: string = ""
+    if header_lines > 0 && header_lines <= lines.len() is
+        let mut rest: [string] = []
+        let mut j: int = header_lines
+        while j < lines.len() is
+            rest.push(lines[j])
+            j += 1
+        end
+        message = str::join(rest, "\n")
+    end
+
+    return error::GitResult::Ok(Commit {
+        _oid: oid::zero(), _tree: tree, _parents: parents,
+        _author: author, _committer: committer, _message: message,
+    })
+end
+
+;; ── Storage ──────────────────────────────────────────────────────────────
+
+;; Write a new commit object, returning its id. Mirrors
+;; `Repository::commit()` in git2, minus the ref-update side effect
+;; (see `porcelain.h#`'s `commit()` for the full "commit + move HEAD"
+;; convenience, and `refs.h#` to update a ref yourself).
+pub fn create(git_dir: string, tree: oid::Oid, parents: [oid::Oid],
+              author: signature::Signature, committer: signature::Signature,
+              message: string) -> oid::Oid is
+    let data: string = serialize(tree, parents, author, committer, message)
+    return object::write(git_dir, object::ObjectType::Commit, data)
+end
+
+pub fn lookup(git_dir: string, id: oid::Oid) -> error::GitResult<Commit> is
+    match object::read(git_dir, id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(raw) => is
+            if !object::type_eq(raw.kind(), object::ObjectType::Commit) is
+                return error::GitResult::Err(error::invalid(id.hex() + " is not a commit"))
+            end
+            match parse(raw.data()) is
+                error::GitResult::Err(e) => error::GitResult::Err(e)
+                error::GitResult::Ok(c)  => is
+                    return error::GitResult::Ok(Commit {
+                        _oid: id, _tree: c.tree_id(), _parents: c.parent_ids(),
+                        _author: c.author(), _committer: c.committer(), _message: c.message(),
+                    })
+                end
+            end
+        end
+    end
+end
