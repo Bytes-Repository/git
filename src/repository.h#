@@ -1,0 +1,142 @@
+mod error
+mod oid
+mod refs
+
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+
+pub struct Repository is
+    pub _git_dir:  string  ;; the ".git" directory itself (or repo root, if bare)
+    pub _work_dir: string  ;; "" for a bare repository
+    pub _bare:     bool
+end
+
+impl Repository is
+    fn path(self)    -> string is return self._git_dir end
+    fn workdir(self) -> string is return self._work_dir end
+    fn is_bare(self) -> bool  is return self._bare end
+
+    ;; Resolve a path relative to `.git`, e.g. `repo.git_path("HEAD")`.
+    fn git_path(self, rel: string) -> string is
+        return path::join(self._git_dir, rel)
+    end
+
+    ;; Resolve a path relative to the working directory. Errors (as a
+    ;; `nil`) on a bare repository, which has none.
+    fn work_path(self, rel: string) -> string? is
+        if self._bare is return nil end
+        return path::join(self._work_dir, rel)
+    end
+
+    fn head(self) -> error::GitResult<oid::Oid> is
+        return refs::head_oid(self._git_dir)
+    end
+
+    fn head_branch(self) -> string? is
+        return refs::head_branch(self._git_dir)
+    end
+
+    fn head_detached(self) -> error::GitResult<bool> is
+        return refs::head_is_detached(self._git_dir)
+    end
+end
+
+;; ── Layout ───────────────────────────────────────────────────────────────
+
+fn default_branch() -> string is return "main" end
+
+fn scaffold(git_dir: string) is
+    fs::mkdir(git_dir)
+    fs::mkdir(path::join(git_dir, "objects"))
+    fs::mkdir(path::join(git_dir, "refs"))
+    fs::mkdir(path::join(git_dir, "refs/heads"))
+    fs::mkdir(path::join(git_dir, "refs/tags"))
+    refs::write_symbolic(git_dir, refs::head_ref_name(), refs::branch_ref_name(default_branch()))
+    fs::write(path::join(git_dir, "description"), "Unnamed repository; edit this file to name it for gitweb.\n")
+    fs::write(path::join(git_dir, "config"), default_config(false))
+end
+
+fn default_config(bare: bool) -> string is
+    let mut out: string = "[core]\n"
+    out = out + "\trepositoryformatversion = 0\n"
+    out = out + "\tfilemode = true\n"
+    out = out + "\tbare = " + bool_str(bare) + "\n"
+    return out
+end
+
+fn bool_str(b: bool) -> string is
+    if b is return "true" end
+    return "false"
+end
+
+;; ── init / open / discover ───────────────────────────────────────────────
+
+;; Create a brand-new repository at `dir` (created if it doesn't exist
+;; yet). Mirrors `Repository::init()` / `init_bare()` in git2. Errors
+;; with `ErrorKind::Exists` if a repository is already there.
+pub fn init(dir: string, bare: bool) -> error::GitResult<Repository> is
+    if bare is
+        if fs::exists(dir) && is_repo_layout(dir) is
+            return error::GitResult::Err(error::exists("repository at " + dir))
+        end
+        scaffold(dir)
+        return error::GitResult::Ok(Repository { _git_dir: dir, _work_dir: "", _bare: true })
+    end
+
+    let git_dir: string = path::join(dir, ".git")
+    if fs::exists(git_dir) is
+        return error::GitResult::Err(error::exists("repository at " + dir))
+    end
+    fs::mkdir(dir)
+    scaffold(git_dir)
+    return error::GitResult::Ok(Repository { _git_dir: git_dir, _work_dir: dir, _bare: false })
+end
+
+fn is_repo_layout(git_dir: string) -> bool is
+    return fs::is_dir(git_dir) &&
+           fs::exists(path::join(git_dir, "HEAD")) &&
+           fs::is_dir(path::join(git_dir, "objects")) &&
+           fs::is_dir(path::join(git_dir, "refs"))
+end
+
+;; Open an existing repository. `dir` may be either a working directory
+;; (containing `.git/`) or a bare repository directory itself.
+pub fn open(dir: string) -> error::GitResult<Repository> is
+    if !fs::exists(dir) is
+        return error::GitResult::Err(error::not_found("directory " + dir))
+    end
+
+    let nested: string = path::join(dir, ".git")
+    if fs::is_dir(nested) && is_repo_layout(nested) is
+        return error::GitResult::Ok(Repository { _git_dir: nested, _work_dir: dir, _bare: false })
+    end
+
+    if is_repo_layout(dir) is
+        return error::GitResult::Ok(Repository { _git_dir: dir, _work_dir: "", _bare: true })
+    end
+
+    return error::GitResult::Err(error::not_found("git repository at " + dir))
+end
+
+;; Walk upward from `start` looking for a repository, the way real Git
+;; resolves the repo for a command run from a subdirectory. Mirrors
+;; `Repository::discover()`.
+pub fn discover(start: string) -> error::GitResult<Repository> is
+    let mut current: string = start
+    let mut hops: int = 0
+    while hops < 128 is
+        let candidate = open(current)
+        match candidate is
+            error::GitResult::Ok(_) => return candidate
+            error::GitResult::Err(_) => is
+                let parent: string = path::parent(current)
+                if parent.len() == 0 || parent == current is
+                    return error::GitResult::Err(error::not_found("git repository (walked up from " + start + ")"))
+                end
+                current = parent
+            end
+        end
+        hops += 1
+    end
+    return error::GitResult::Err(error::not_found("git repository (walked up from " + start + ")"))
+end
