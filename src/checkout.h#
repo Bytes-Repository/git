@@ -1,0 +1,109 @@
+mod error
+mod oid
+mod tree
+mod object
+mod refs
+mod index
+mod commit
+
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+
+;; Write every blob reachable from `tree_id` into `work_dir`, recursively
+;; recreating subdirectories, and overwriting any files already there.
+;; This does not remove files that exist in `work_dir` but not in the
+;; tree — see `checkout_tree_clean` for that.
+pub fn checkout_tree(git_dir: string, work_dir: string, tree_id: oid::Oid) -> error::GitResult<bool> is
+    return write_tree_to_dir(git_dir, tree_id, work_dir)
+end
+
+fn write_tree_to_dir(git_dir: string, tree_id: oid::Oid, dest_dir: string) -> error::GitResult<bool> is
+    match tree::lookup(git_dir, tree_id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(t)  => is
+            fs::mkdir(dest_dir)
+            let entries: [tree::TreeEntry] = t.entries()
+            let mut i: int = 0
+            while i < entries.len() is
+                let dest: string = path::join(dest_dir, entries[i].name())
+                if entries[i].is_dir() is
+                    let sub = write_tree_to_dir(git_dir, entries[i].id(), dest)
+                    if error::is_err(sub) is return sub end
+                else is
+                    match object::read(git_dir, entries[i].id()) is
+                        error::GitResult::Err(e2) => return error::GitResult::Err(e2)
+                        error::GitResult::Ok(obj) => fs::write(dest, obj.data())
+                    end
+                end
+                i += 1
+            end
+            return error::GitResult::Ok(true)
+        end
+    end
+end
+
+;; Like `checkout_tree`, but first removes every file under `work_dir`
+;; that is not `.git` itself, so the working directory ends up an exact
+;; mirror of the tree (mirrors `CheckoutBuilder::remove_untracked()` +
+;; force in git2). Use with care — this deletes uncommitted work.
+pub fn checkout_tree_clean(git_dir: string, work_dir: string, tree_id: oid::Oid) -> error::GitResult<bool> is
+    clear_workdir(work_dir)
+    return checkout_tree(git_dir, work_dir, tree_id)
+end
+
+fn clear_workdir(work_dir: string) is
+    if !fs::is_dir(work_dir) is return end
+    let names: [string] = fs::list_dir(work_dir)
+    let mut i: int = 0
+    while i < names.len() is
+        if names[i] != ".git" is
+            let full: string = path::join(work_dir, names[i])
+            if fs::is_dir(full) is
+                fs::rmdir_all(full)
+            else is
+                fs::remove(full)
+            end
+        end
+        i += 1
+    end
+end
+
+;; Full "switch to this branch" operation: resolve the branch's commit,
+;; write its tree into the working directory (clean), rebuild the index
+;; to match, and move HEAD. Mirrors git2's
+;; `Repository::set_head()` + `checkout_head()` combo most callers reach
+;; for together.
+pub fn checkout_branch(git_dir: string, work_dir: string, branch_name: string) -> error::GitResult<oid::Oid> is
+    match refs::resolve(git_dir, refs::branch_ref_name(branch_name)) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(target) => is
+            let result = checkout_commit(git_dir, work_dir, target)
+            match result is
+                error::GitResult::Err(e2) => return error::GitResult::Err(e2)
+                error::GitResult::Ok(_)   => is
+                    refs::set_head_to_branch(git_dir, branch_name)
+                    return error::GitResult::Ok(target)
+                end
+            end
+        end
+    end
+end
+
+;; Detach HEAD at a specific commit and materialize it. Mirrors
+;; git2's detached-HEAD checkout path.
+pub fn checkout_commit(git_dir: string, work_dir: string, commit_id: oid::Oid) -> error::GitResult<bool> is
+    match commit::lookup(git_dir, commit_id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(c)  => is
+            let done = checkout_tree_clean(git_dir, work_dir, c.tree_id())
+            if error::is_err(done) is return done end
+            match index::read_tree(git_dir, c.tree_id()) is
+                error::GitResult::Err(e2) => error::GitResult::Err(e2)
+                error::GitResult::Ok(idx) => is
+                    index::write(git_dir, idx)
+                    return error::GitResult::Ok(true)
+                end
+            end
+        end
+    end
+end
