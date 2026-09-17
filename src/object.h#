@@ -1,0 +1,141 @@
+mod error
+mod oid
+
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> archive" from "archive"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+;; ── Object type ──────────────────────────────────────────────────────────
+
+pub enum ObjectType is
+    Blob
+    Tree
+    Commit
+    Tag
+    Unknown
+end
+
+pub fn type_name(t: ObjectType) -> string is
+    match t is
+        ObjectType::Blob    => "blob"
+        ObjectType::Tree    => "tree"
+        ObjectType::Commit  => "commit"
+        ObjectType::Tag     => "tag"
+        ObjectType::Unknown => "unknown"
+    end
+end
+
+pub fn type_from_name(name: string) -> ObjectType is
+    match name is
+        "blob"   => ObjectType::Blob
+        "tree"   => ObjectType::Tree
+        "commit" => ObjectType::Commit
+        "tag"    => ObjectType::Tag
+        _        => ObjectType::Unknown
+    end
+end
+
+pub fn type_eq(a: ObjectType, b: ObjectType) -> bool is
+    return type_name(a) == type_name(b)
+end
+
+;; ── RawObject ────────────────────────────────────────────────────────────
+
+pub struct RawObject is
+    pub _kind: ObjectType
+    pub _oid:  oid::Oid
+    pub _data: string
+end
+
+impl RawObject is
+    fn kind(self) -> ObjectType is return self._kind end
+    fn id(self)   -> oid::Oid   is return self._oid end
+    fn data(self) -> string     is return self._data end
+    fn size(self) -> int        is return self._data.len() end
+end
+
+;; ── Encoding / hashing ───────────────────────────────────────────────────
+
+fn header_of(kind: ObjectType, data_len: int) -> string is
+    return type_name(kind) + " " + conv::int_to_str(data_len) + "\n"
+end
+
+;; Compute the id a piece of content would get *without* writing it —
+;; mirrors `git hash-object` (no `-w`).
+pub fn hash(kind: ObjectType, data: string) -> oid::Oid is
+    return oid::hash(header_of(kind, data.len()) + data)
+end
+
+;; ── On-disk layout ───────────────────────────────────────────────────────
+
+pub fn loose_path(git_dir: string, id: oid::Oid) -> string is
+    let h: string = id.hex()
+    return path::join(git_dir, "objects/" + h[0..2] + "/" + h[2..h.len()])
+end
+
+pub fn exists(git_dir: string, id: oid::Oid) -> bool is
+    return fs::exists(loose_path(git_dir, id))
+end
+
+;; Write `data` as a loose object of the given type. Idempotent — if the
+;; content-addressed id already exists on disk, this is a no-op read of
+;; the id (same as real Git deduplicating identical blobs/trees).
+pub fn write(git_dir: string, kind: ObjectType, data: string) -> oid::Oid is
+    let id: oid::Oid = hash(kind, data)
+    if exists(git_dir, id) is return id end
+
+    let full: string = header_of(kind, data.len()) + data
+    let compressed: string = archive::gzip_compress(full)
+    let p: string = loose_path(git_dir, id)
+    fs::mkdir(path::parent(p))
+    fs::write(p, compressed)
+    return id
+end
+
+;; Read a loose object back and verify its header matches what its
+;; filename claims (catches truncated/corrupted objects early, the same
+;; spirit as `git cat-file -p` erroring on a bad object).
+pub fn read(git_dir: string, id: oid::Oid) -> error::GitResult<RawObject> is
+    let p: string = loose_path(git_dir, id)
+    if !fs::exists(p) is
+        return error::GitResult::Err(error::not_found("object " + id.hex()))
+    end
+
+    let raw: string = fs::read(p)
+    let full: string = archive::gzip_decompress(raw)
+    let nl: int = str::index_of(full, "\n")
+    if nl < 0 is
+        return error::GitResult::Err(error::corrupt("object " + id.hex() + " has no header terminator"))
+    end
+
+    let header: string = full[0..nl]
+    let payload: string = full[nl + 1..full.len()]
+    let parts: [string] = str::split(header, " ")
+    if parts.len() != 2 is
+        return error::GitResult::Err(error::corrupt("object " + id.hex() + " has a malformed header"))
+    end
+
+    let kind: ObjectType = type_from_name(parts[0])
+    if type_eq(kind, ObjectType::Unknown) is
+        return error::GitResult::Err(error::corrupt("object " + id.hex() + " has an unknown type '" + parts[0] + "'"))
+    end
+
+    let declared_len: int = conv::str_to_int(parts[1])
+    if declared_len != payload.len() is
+        return error::GitResult::Err(error::corrupt("object " + id.hex() + " size mismatch"))
+    end
+
+    return error::GitResult::Ok(RawObject { _kind: kind, _oid: id, _data: payload })
+end
+
+;; Convenience used by callers that only need to know an object's type
+;; without pulling its full payload into memory (e.g. `hgit cat-file -t`
+;; equivalents).
+pub fn read_kind(git_dir: string, id: oid::Oid) -> error::GitResult<ObjectType> is
+    match read(git_dir, id) is
+        error::GitResult::Ok(obj) => error::GitResult::Ok(obj.kind())
+        error::GitResult::Err(e)  => error::GitResult::Err(e)
+    end
+end
