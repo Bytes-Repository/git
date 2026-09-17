@@ -1,0 +1,80 @@
+use "std -> time"    from "t"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+pub struct Signature is
+    pub _name:   string
+    pub _email:  string
+    pub _when:   int   ;; unix timestamp, seconds
+    pub _offset: int   ;; minutes east of UTC (matches git2's `Time::offset_minutes`)
+end
+
+impl Signature is
+    fn new(name: string, email: string, when: int, offset_minutes: int) -> Signature is
+        return Signature { _name: name, _email: email, _when: when, _offset: offset_minutes }
+    end
+
+    ;; A signature stamped "now", in UTC (offset 0). Use `new` directly if
+    ;; you need a specific timezone offset preserved.
+    fn now(name: string, email: string) -> Signature is
+        return Signature { _name: name, _email: email, _when: t::now_unix(), _offset: 0 }
+    end
+
+    fn name(self)   -> string is return self._name end
+    fn email(self)  -> string is return self._email end
+    fn when(self)   -> int    is return self._when end
+    fn offset(self) -> int    is return self._offset end
+
+    ;; The exact line format Git writes inside a commit/tag object:
+    ;;   Jane Doe <jane@example.com> 1732550400 +0200
+    fn to_line(self) -> string is
+        return self._name + " <" + self._email + "> " +
+               conv::int_to_str(self._when) + " " + offset_str(self._offset)
+    end
+end
+
+fn offset_str(minutes: int) -> string is
+    let mut m: int = minutes
+    let mut sign: string = "+"
+    if m < 0 is
+        sign = "-"
+        m = -m
+    end
+    let hh: int = m / 60
+    let mm: int = m % 60
+    return sign + str::pad_start(conv::int_to_str(hh), 2, "0") +
+                  str::pad_start(conv::int_to_str(mm), 2, "0")
+end
+
+fn parse_offset(s: string) -> int is
+    if s.len() != 5 is return 0 end
+    let sign: string = s[0..1]
+    let hh: int = conv::str_to_int(s[1..3])
+    let mm: int = conv::str_to_int(s[3..5])
+    let total: int = hh * 60 + mm
+    if sign == "-" is return -total end
+    return total
+end
+
+;; Parse a signature line as Git writes it: "Name <email> <ts> <+HHMM>".
+;; Returns nil on anything that doesn't fit that shape — used while
+;; parsing commit/tag objects (see commit.h#/tag.h#), where a malformed
+;; line should surface as `error::corrupt`, not a crash.
+pub fn parse_line(line: string) -> Signature? is
+    let lt: int = str::index_of(line, "<")
+    let gt: int = str::index_of(line, ">")
+    if lt < 0 || gt < 0 || gt < lt is return nil end
+
+    let name: string = str::trim(line[0..lt])
+    let email: string = line[lt + 1..gt]
+    let rest: string = str::trim(line[gt + 1..line.len()])
+    let parts: [string] = str::split_whitespace(rest)
+    if parts.len() < 1 is return nil end
+
+    let when: int = conv::str_to_int(parts[0])
+    let mut offset: int = 0
+    if parts.len() >= 2 is
+        offset = parse_offset(parts[1])
+    end
+    return Signature::new(name, email, when, offset)
+end
