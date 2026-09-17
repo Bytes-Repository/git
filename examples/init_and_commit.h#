@@ -1,0 +1,48 @@
+use "hlib -> hgit" from "hgit"
+use "std -> fs"   from "fs"
+use "std -> time" from "t"
+
+fn main() is
+    let dir: string = "/tmp/hgit-example-repo"
+
+    let init_result = hgit::repository::init(dir, false)
+    match init_result is
+        hgit::error::GitResult::Err(e) => is
+            write("init failed: " + e.to_string())
+            return
+        end
+        hgit::error::GitResult::Ok(repo) => is
+            write("initialized empty repository at " + repo.path())
+
+            ;; Write a couple of files into the new working directory.
+            fs::write(dir + "/README.md", "# hgit demo\n\nHello from H#!\n")
+            fs::write(dir + "/notes.txt", "first line\n")
+
+            let author = hgit::signature::Signature::new(
+                "Ada", "ada@example.com", t::now_unix(), 0)
+
+            let commit_result = hgit::porcelain::commit_all(repo, "Initial commit", author)
+            match commit_result is
+                hgit::error::GitResult::Ok(commit_id) => is
+                    write("created commit " + commit_id.short())
+                end
+                hgit::error::GitResult::Err(e2) => is
+                    write("commit failed: " + e2.to_string())
+                end
+            end
+
+            let log_result = hgit::porcelain::log(repo)
+            match log_result is
+                hgit::error::GitResult::Ok(lines) => is
+                    write("history:")
+                    let mut i: int = 0
+                    while i < lines.len() is
+                        write("  " + lines[i])
+                        i += 1
+                    end
+                end
+                hgit::error::GitResult::Err(_) => is end
+            end
+        end
+    end
+end
