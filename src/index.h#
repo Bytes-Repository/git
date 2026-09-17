@@ -1,0 +1,284 @@
+mod error
+mod oid
+mod tree
+mod object
+
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+
+pub struct IndexEntry is
+    pub _mode: string
+    pub _oid:  oid::Oid
+    pub _path: string  ;; workdir-relative, "/"-separated
+end
+
+impl IndexEntry is
+    fn mode(self) -> string  is return self._mode end
+    fn id(self)   -> oid::Oid is return self._oid end
+    fn path(self) -> string  is return self._path end
+end
+
+pub struct Index is
+    pub _entries: [IndexEntry]
+end
+
+impl Index is
+    fn new() -> Index is
+        return Index { _entries: [] }
+    end
+
+    fn len(self) -> int is return self._entries.len() end
+    fn is_empty(self) -> bool is return self._entries.len() == 0 end
+    fn entries(self) -> [IndexEntry] is return self._entries end
+
+    fn get(self, rel_path: string) -> IndexEntry? is
+        let mut i: int = 0
+        while i < self._entries.len() is
+            if self._entries[i].path() == rel_path is return self._entries[i] end
+            i += 1
+        end
+        return nil
+    end
+
+    fn contains(self, rel_path: string) -> bool is
+        return self.get(rel_path) != nil
+    end
+
+    ;; Stage a single blob at `rel_path` with the given mode/oid. Callers
+    ;; typically go through `add_path`/`add_all` below instead, which
+    ;; also hash the file content for you.
+    fn add(self, mode: string, id: oid::Oid, rel_path: string) is
+        let mut i: int = 0
+        let mut found: bool = false
+        while i < self._entries.len() is
+            if self._entries[i].path() == rel_path is
+                self._entries[i] = IndexEntry { _mode: mode, _oid: id, _path: rel_path }
+                found = true
+            end
+            i += 1
+        end
+        if !found is
+            self._entries.push(IndexEntry { _mode: mode, _oid: id, _path: rel_path })
+        end
+    end
+
+    fn remove(self, rel_path: string) is
+        let mut kept: [IndexEntry] = []
+        let mut i: int = 0
+        while i < self._entries.len() is
+            if self._entries[i].path() != rel_path is kept.push(self._entries[i]) end
+            i += 1
+        end
+        self._entries = kept
+    end
+
+    fn clear(self) is
+        self._entries = []
+    end
+end
+
+;; ── Serialization / storage ──────────────────────────────────────────────
+
+fn index_path(git_dir: string) -> string is
+    return path::join(git_dir, "index")
+end
+
+pub fn read(git_dir: string) -> Index is
+    let p: string = index_path(git_dir)
+    if !fs::exists(p) is return Index { _entries: [] } end
+
+    let content: string = fs::read(p)
+    let mut entries: [IndexEntry] = []
+    if content.len() == 0 is return Index { _entries: entries } end
+
+    let lines: [string] = str::split(str::trim_end(content), "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i].len() > 0 is
+            let parts: [string] = str::splitn(lines[i], " ", 3)
+            if parts.len() == 3 is
+                let id = oid::from_hex(parts[1])
+                if id != nil is
+                    entries.push(IndexEntry { _mode: parts[0], _oid: id, _path: parts[2] })
+                end
+            end
+        end
+        i += 1
+    end
+    return Index { _entries: entries }
+end
+
+pub fn write(git_dir: string, idx: Index) is
+    let sorted: [IndexEntry] = sort_by_path(idx.entries())
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < sorted.len() is
+        out = out + sorted[i].mode() + " " + sorted[i].id().hex() + " " + sorted[i].path() + "\n"
+        i += 1
+    end
+    fs::write(index_path(git_dir), out)
+end
+
+fn sort_by_path(entries: [IndexEntry]) -> [IndexEntry] is
+    let mut out: [IndexEntry] = entries
+    let n: int = out.len()
+    let mut i: int = 1
+    while i < n is
+        let mut j: int = i
+        while j > 0 && out[j - 1].path() > out[j].path() is
+            let tmp: IndexEntry = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = tmp
+            j -= 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── Staging from the working directory ──────────────────────────────────
+
+;; Stage one file: read it off disk, write it as a blob, add it to the
+;; index (which is re-read/written from disk, so this is safe to call
+;; repeatedly without holding an `Index` across calls). `rel_path` is
+;; relative to `work_dir`. Mirrors `git add <path>` for a single file.
+pub fn add_path(git_dir: string, work_dir: string, rel_path: string) -> error::GitResult<oid::Oid> is
+    let full: string = path::join(work_dir, rel_path)
+    if !fs::is_file(full) is
+        return error::GitResult::Err(error::not_found(rel_path))
+    end
+    let content: string = fs::read(full)
+    let id: oid::Oid = object::write(git_dir, object::ObjectType::Blob, content)
+
+    let mut idx: Index = read(git_dir)
+    idx.add(tree::mode_file(), id, normalize_sep(rel_path))
+    write(git_dir, idx)
+    return error::GitResult::Ok(id)
+end
+
+;; Stage every file under `work_dir` (excluding `.git` itself). Mirrors
+;; `git add -A`. Respects `ignore.h#`'s `is_ignored` if a caller wants
+;; to pre-filter `rel_paths`; this function itself stages exactly what
+;; `fs::walk` finds, so callers that care about `.gitignore` should
+;; filter via `ignore::filter` first (see `porcelain.h#`'s `commit_all`
+;; for the full wiring).
+pub fn add_all(git_dir: string, work_dir: string) -> [string] is
+    let files: [string] = fs::walk(work_dir)
+    let mut idx: Index = read(git_dir)
+    let mut staged: [string] = []
+    let mut i: int = 0
+    while i < files.len() is
+        let rel: string = normalize_sep(files[i][work_dir.len() + 1..files[i].len()])
+        if !rel.starts_with(".git/") && rel != ".git" is
+            let content: string = fs::read(files[i])
+            let id: oid::Oid = object::write(git_dir, object::ObjectType::Blob, content)
+            idx.add(tree::mode_file(), id, rel)
+            staged.push(rel)
+        end
+        i += 1
+    end
+    write(git_dir, idx)
+    return staged
+end
+
+pub fn remove_path(git_dir: string, rel_path: string) is
+    let mut idx: Index = read(git_dir)
+    idx.remove(normalize_sep(rel_path))
+    write(git_dir, idx)
+end
+
+fn normalize_sep(p: string) -> string is
+    return str::replace_all(p, "\\", "/")
+end
+
+;; ── index <-> tree ───────────────────────────────────────────────────────
+
+;; Build the nested tree objects for everything currently staged, and
+;; return the id of the root tree. Mirrors `Index::write_tree()`.
+pub fn write_tree(git_dir: string, idx: Index) -> oid::Oid is
+    return write_tree_for_prefix(git_dir, idx.entries(), "")
+end
+
+;; Recursively group entries by their first path component under
+;; `prefix`, write each subdirectory as its own tree, and write the
+;; resulting entry list as this level's tree.
+fn write_tree_for_prefix(git_dir: string, entries: [IndexEntry], prefix: string) -> oid::Oid is
+    let mut direct: [tree::TreeEntry] = []
+    let mut subdirs: [string] = []
+    let mut seen_dirs: [string] = []
+
+    let mut i: int = 0
+    while i < entries.len() is
+        let p: string = entries[i].path()
+        if p.starts_with(prefix) is
+            let rest: string = p[prefix.len()..p.len()]
+            let slash: int = str::index_of(rest, "/")
+            if slash < 0 is
+                direct.push(tree::TreeEntry::new(entries[i].mode(), object::ObjectType::Blob, entries[i].id(), rest))
+            else is
+                let dir_name: string = rest[0..slash]
+                if !contains_str(seen_dirs, dir_name) is
+                    seen_dirs.push(dir_name)
+                    subdirs.push(dir_name)
+                end
+            end
+        end
+        i += 1
+    end
+
+    let mut j: int = 0
+    while j < subdirs.len() is
+        let sub_id: oid::Oid = write_tree_for_prefix(git_dir, entries, prefix + subdirs[j] + "/")
+        direct.push(tree::TreeEntry::new(tree::mode_tree(), object::ObjectType::Tree, sub_id, subdirs[j]))
+        j += 1
+    end
+
+    return tree::create(git_dir, direct)
+end
+
+fn contains_str(arr: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < arr.len() is
+        if arr[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Replace the index contents with everything reachable from `tree_id`,
+;; recursively — mirrors `Index::read_tree()`. Used by `reset.h#` (hard
+;; reset) and `branch.h#` (checkout) to make the index match a commit.
+pub fn read_tree(git_dir: string, tree_id: oid::Oid) -> error::GitResult<Index> is
+    let mut entries: [IndexEntry] = []
+    let err = collect_tree_entries(git_dir, tree_id, "", entries)
+    match err is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(collected) => error::GitResult::Ok(Index { _entries: collected })
+    end
+end
+
+fn collect_tree_entries(git_dir: string, tree_id: oid::Oid, prefix: string,
+                         acc: [IndexEntry]) -> error::GitResult<[IndexEntry]> is
+    match tree::lookup(git_dir, tree_id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(t)  => is
+            let mut out: [IndexEntry] = acc
+            let entries: [tree::TreeEntry] = t.entries()
+            let mut i: int = 0
+            while i < entries.len() is
+                let full_path: string = prefix + entries[i].name()
+                if entries[i].is_dir() is
+                    match collect_tree_entries(git_dir, entries[i].id(), full_path + "/", out) is
+                        error::GitResult::Err(e2) => return error::GitResult::Err(e2)
+                        error::GitResult::Ok(nested) => out = nested
+                    end
+                else is
+                    out.push(IndexEntry { _mode: entries[i].mode(), _oid: entries[i].id(), _path: full_path })
+                end
+                i += 1
+            end
+            return error::GitResult::Ok(out)
+        end
+    end
+end
