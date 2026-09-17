@@ -1,0 +1,71 @@
+use "hlib -> hgit" from "hgit"
+use "std -> fs" from "fs"
+use "std -> time" from "t"
+
+fn sig() -> hgit::signature::Signature is
+    return hgit::signature::Signature::new("Ada", "ada@example.com", t::now_unix(), 0)
+end
+
+fn main() is
+    let dir: string = "/tmp/hgit-example-branches"
+    if fs::exists(dir) is fs::rmdir_all(dir) end
+
+    match hgit::repository::init(dir, false) is
+        hgit::error::GitResult::Err(e) => write("init failed: " + e.to_string())
+        hgit::error::GitResult::Ok(repo) => is
+            fs::write(dir + "/app.txt", "version 1\n")
+            let c1 = hgit::porcelain::commit_all(repo, "v1", sig())
+
+            match c1 is
+                hgit::error::GitResult::Err(_) => write("first commit failed")
+                hgit::error::GitResult::Ok(base) => is
+                    ;; branch off, make a change there
+                    hgit::branch::create(repo.path(), "feature", base)
+                    hgit::checkout::checkout_branch(repo.path(), repo.workdir(), "feature")
+
+                    fs::write(dir + "/app.txt", "version 2\n")
+                    let c2 = hgit::porcelain::commit_all(repo, "v2 on feature", sig())
+
+                    ;; back to main, fast-forward it onto feature
+                    hgit::checkout::checkout_branch(repo.path(), repo.workdir(), "main")
+                    let merged = hgit::porcelain::merge_fast_forward(repo, "feature")
+                    match merged is
+                        hgit::error::GitResult::Ok(new_head) => write("main fast-forwarded to " + new_head.short())
+                        hgit::error::GitResult::Err(e2) => write("merge failed: " + e2.to_string())
+                    end
+
+                    ;; diff the two commits' trees
+                    match c2 is
+                        hgit::error::GitResult::Ok(feature_commit) => is
+                            show_diff(repo, base, feature_commit)
+                        end
+                        hgit::error::GitResult::Err(_) => is end
+                    end
+                end
+            end
+        end
+    end
+end
+
+fn show_diff(repo: hgit::repository::Repository, from_commit: hgit::oid::Oid, to_commit: hgit::oid::Oid) is
+    let from_tree = tree_of(repo, from_commit)
+    let to_tree = tree_of(repo, to_commit)
+    match hgit::diff::diff_trees(repo.path(), from_tree, to_tree) is
+        hgit::error::GitResult::Ok(deltas) => is
+            write("changed files:")
+            let mut i: int = 0
+            while i < deltas.len() is
+                write("  " + hgit::diff::status_name(deltas[i].status()) + " " + deltas[i].path())
+                i += 1
+            end
+        end
+        hgit::error::GitResult::Err(e) => write("diff failed: " + e.to_string())
+    end
+end
+
+fn tree_of(repo: hgit::repository::Repository, commit_id: hgit::oid::Oid) -> hgit::oid::Oid is
+    match hgit::commit::lookup(repo.path(), commit_id) is
+        hgit::error::GitResult::Ok(c) => c.tree_id()
+        hgit::error::GitResult::Err(_) => hgit::oid::zero()
+    end
+end
