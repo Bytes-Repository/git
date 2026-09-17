@@ -1,0 +1,140 @@
+mod error
+mod oid
+mod object
+mod tree
+mod commit
+mod signature
+mod index
+mod refs
+mod repository
+mod revwalk
+mod ignore
+mod status
+mod checkout
+
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+
+;; Stage every tracked/untracked file under the repo's working
+;; directory (respecting `.gitignore`), write the resulting tree, and
+;; create a commit on the current branch with HEAD (and the branch ref)
+;; as its parent. Mirrors `git add -A && git commit -m message`.
+;;
+;; On a brand-new repository (no commits yet), this creates the first,
+;; parentless commit — mirrors git2's "unborn branch" handling.
+pub fn commit_all(repo: repository::Repository, message: string,
+                   author: signature::Signature) -> error::GitResult<oid::Oid> is
+    if repo.is_bare() is
+        return error::GitResult::Err(error::invalid("cannot commit_all in a bare repository"))
+    end
+
+    let git_dir: string = repo.path()
+    let work_dir: string = repo.workdir()
+    let rules: ignore::IgnoreRules = ignore::load(work_dir)
+
+    stage_directory(git_dir, work_dir, work_dir, rules)
+
+    let idx: index::Index = index::read(git_dir)
+    let tree_id: oid::Oid = index::write_tree(git_dir, idx)
+
+    let mut parents: [oid::Oid] = []
+    match refs::head_oid(git_dir) is
+        error::GitResult::Ok(head_id) => parents.push(head_id)
+        error::GitResult::Err(_)      => is end
+    end
+
+    let commit_id: oid::Oid = commit::create(git_dir, tree_id, parents, author, author, message)
+
+    let branch = refs::head_branch(git_dir)
+    if branch != nil is
+        refs::write_direct(git_dir, refs::branch_ref_name(branch), commit_id)
+    else is
+        refs::set_head_detached(git_dir, commit_id)
+    end
+
+    return error::GitResult::Ok(commit_id)
+end
+
+fn stage_directory(git_dir: string, work_dir: string, dir: string, rules: ignore::IgnoreRules) is
+    if !fs::is_dir(dir) is return end
+    let names: [string] = fs::list_dir(dir)
+    let mut i: int = 0
+    while i < names.len() is
+        let full: string = path::join(dir, names[i])
+        let rel: string = full[work_dir.len() + 1..full.len()]
+        if !ignore::is_ignored(rules, rel) is
+            if fs::is_dir(full) is
+                stage_directory(git_dir, work_dir, full, rules)
+            else is
+                let content: string = fs::read(full)
+                let id: oid::Oid = object::write(git_dir, object::ObjectType::Blob, content)
+                let mut idx: index::Index = index::read(git_dir)
+                idx.add(tree::mode_file(), id, rel)
+                index::write(git_dir, idx)
+            end
+        end
+        i += 1
+    end
+end
+
+;; `git log`-style formatted history for the currently checked-out
+;; branch (or detached HEAD), newest first.
+pub fn log(repo: repository::Repository) -> error::GitResult<[string]> is
+    match repo.head() is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(head_id) => is
+            match revwalk::log(repo.path(), head_id) is
+                error::GitResult::Err(e2) => error::GitResult::Err(e2)
+                error::GitResult::Ok(commits) => error::GitResult::Ok(revwalk::format_oneline(commits))
+            end
+        end
+    end
+end
+
+;; Fast-forward-only merge: move the current branch to `other`'s
+;; commit if (and only if) the current branch's commit is an ancestor
+;; of it. Mirrors the fast-forward half of git2's `Repository::merge()`
+;; — see the README's "Known limitations" for why a real three-way
+;; content merge is out of scope.
+pub fn merge_fast_forward(repo: repository::Repository, other_branch: string) -> error::GitResult<oid::Oid> is
+    let git_dir: string = repo.path()
+    match refs::resolve(git_dir, refs::branch_ref_name(other_branch)) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(their_id) => is
+            match repo.head() is
+                error::GitResult::Err(e2) => error::GitResult::Err(e2)
+                error::GitResult::Ok(our_id) => is
+                    match revwalk::is_ancestor(git_dir, our_id, their_id) is
+                        error::GitResult::Err(e3) => error::GitResult::Err(e3)
+                        error::GitResult::Ok(can_ff) => is
+                            if !can_ff is
+                                return error::GitResult::Err(error::conflict(
+                                    "cannot fast-forward: '" + other_branch + "' has diverged from HEAD"))
+                            end
+                            let branch = refs::head_branch(git_dir)
+                            if branch != nil is
+                                refs::write_direct(git_dir, refs::branch_ref_name(branch), their_id)
+                            else is
+                                refs::set_head_detached(git_dir, their_id)
+                            end
+                            if !repo.is_bare() is
+                                let co = checkout::checkout_commit(git_dir, repo.workdir(), their_id)
+                                if error::is_err(co) is return error::GitResult::Err(error::unwrap_err(co)) end
+                            end
+                            return error::GitResult::Ok(their_id)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+;; Whether the working directory + index are clean relative to HEAD.
+pub fn is_clean(repo: repository::Repository) -> error::GitResult<bool> is
+    if repo.is_bare() is return error::GitResult::Ok(true) end
+    match status::status(repo.path(), repo.workdir()) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(entries) => error::GitResult::Ok(status::is_clean(entries))
+    end
+end
