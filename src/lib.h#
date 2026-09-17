@@ -1,1 +1,25 @@
+mod error
+mod oid
+mod signature
+mod object
+mod blob
+mod tree
+mod commit
+mod tag
+mod refs
+mod index
+mod repository
+mod checkout
+mod branch
+mod revwalk
+mod diff
+mod status
+mod ignore
+mod gitconfig
+mod reset
+mod clone
+mod porcelain
 
+;; hgit's own version, following the same "zero-arg fn as a constant"
+;; convention used throughout this codebase (see oid.h#'s `hex_len()`).
+pub fn version() -> string is return "0.1.0" end
