@@ -1,0 +1,201 @@
+mod error
+mod oid
+mod object
+
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+;; Git's own mode constants. hgit only distinguishes the handful that
+;; matter for a working tree checkout; symlinks/submodules are modeled
+;; but not specially interpreted by `checkout.h#` yet (see its header
+;; comment).
+pub fn mode_file() -> string       is return "100644" end
+pub fn mode_executable() -> string is return "100755" end
+pub fn mode_symlink() -> string    is return "120000" end
+pub fn mode_tree() -> string       is return "40000"  end
+pub fn mode_gitlink() -> string    is return "160000" end
+
+pub struct TreeEntry is
+    pub _mode: string
+    pub _kind: object::ObjectType  ;; Blob or Tree (Commit for gitlinks/submodules)
+    pub _oid:  oid::Oid
+    pub _name: string
+end
+
+impl TreeEntry is
+    fn new(mode: string, kind: object::ObjectType, id: oid::Oid, name: string) -> TreeEntry is
+        return TreeEntry { _mode: mode, _kind: kind, _oid: id, _name: name }
+    end
+
+    fn mode(self) -> string          is return self._mode end
+    fn kind(self) -> object::ObjectType is return self._kind end
+    fn id(self)   -> oid::Oid        is return self._oid end
+    fn name(self) -> string          is return self._name end
+    fn is_dir(self)  -> bool is return object::type_eq(self._kind, object::ObjectType::Tree) end
+    fn is_file(self) -> bool is return !self.is_dir() end
+
+    fn to_line(self) -> string is
+        return self._mode + " " + object::type_name(self._kind) + " " +
+               self._oid.hex() + " " + self._name
+    end
+end
+
+pub struct Tree is
+    pub _oid:     oid::Oid
+    pub _entries: [TreeEntry]
+end
+
+impl Tree is
+    fn id(self) -> oid::Oid is return self._oid end
+    fn len(self) -> int is return self._entries.len() end
+    fn is_empty(self) -> bool is return self._entries.len() == 0 end
+    fn entries(self) -> [TreeEntry] is return self._entries end
+
+    ;; Look up a direct child by name (not a path — see `tree_ext.h#`-style
+    ;; helpers in `repository.h#`/`checkout.h#` for path-walking).
+    fn get(self, name: string) -> TreeEntry? is
+        let mut i: int = 0
+        while i < self._entries.len() is
+            if self._entries[i].name() == name is return self._entries[i] end
+            i += 1
+        end
+        return nil
+    end
+end
+
+;; ── Serialization ────────────────────────────────────────────────────────
+
+fn parse_line(line: string) -> TreeEntry? is
+    let parts: [string] = str::splitn(line, " ", 4)
+    if parts.len() != 4 is return nil end
+    let id: oid::Oid = oid::from_hex(parts[2])?
+    return TreeEntry::new(parts[0], object::type_from_name(parts[1]), id, parts[3])
+end
+
+pub fn serialize(entries: [TreeEntry]) -> string is
+    let sorted: [TreeEntry] = sort_entries(entries)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < sorted.len() is
+        out = out + sorted[i].to_line() + "\n"
+        i += 1
+    end
+    return out
+end
+
+pub fn parse(data: string) -> [TreeEntry] is
+    let mut result: [TreeEntry] = []
+    if data.len() == 0 is return result end
+    let lines: [string] = str::split(str::trim_end(data), "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i].len() > 0 is
+            let e: TreeEntry? = parse_line(lines[i])
+            if e != nil is result.push(e) end
+        end
+        i += 1
+    end
+    return result
+end
+
+;; Lexicographic sort by entry name — plain insertion sort; tree entry
+;; counts are small enough (a single directory listing) that this is
+;; simpler and just as fast in practice as pulling in `std -> sort` for
+;; a comparator it doesn't have a string-key variant of.
+fn sort_entries(entries: [TreeEntry]) -> [TreeEntry] is
+    let mut out: [TreeEntry] = entries
+    let n: int = out.len()
+    let mut i: int = 1
+    while i < n is
+        let mut j: int = i
+        while j > 0 && out[j - 1].name() > out[j].name() is
+            let tmp: TreeEntry = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = tmp
+            j -= 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── Storage ──────────────────────────────────────────────────────────────
+
+pub fn create(git_dir: string, entries: [TreeEntry]) -> oid::Oid is
+    return object::write(git_dir, object::ObjectType::Tree, serialize(entries))
+end
+
+pub fn lookup(git_dir: string, id: oid::Oid) -> error::GitResult<Tree> is
+    match object::read(git_dir, id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(raw) => is
+            if !object::type_eq(raw.kind(), object::ObjectType::Tree) is
+                return error::GitResult::Err(error::invalid(id.hex() + " is not a tree"))
+            end
+            return error::GitResult::Ok(Tree { _oid: raw.id(), _entries: parse(raw.data()) })
+        end
+    end
+end
+
+;; ── TreeBuilder ──────────────────────────────────────────────────────────
+;;
+;; Mirrors `git2::TreeBuilder`: accumulate entries, then `write()` them
+;; as one tree object. Building a `TreeBuilder` from an existing tree
+;; (`from_tree`) is how callers modify one entry of a tree without
+;; retyping the rest — exactly the pattern `index.h#`'s `write_tree`
+;; uses recursively for nested directories.
+
+pub struct TreeBuilder is
+    pub _entries: [TreeEntry]
+end
+
+impl TreeBuilder is
+    fn new() -> TreeBuilder is
+        return TreeBuilder { _entries: [] }
+    end
+
+    fn from_tree(t: Tree) -> TreeBuilder is
+        return TreeBuilder { _entries: t.entries() }
+    end
+
+    fn len(self) -> int is return self._entries.len() end
+
+    ;; Insert or overwrite (by name) an entry.
+    fn insert(self, mode: string, kind: object::ObjectType, id: oid::Oid, name: string) is
+        let mut i: int = 0
+        let mut found: bool = false
+        while i < self._entries.len() is
+            if self._entries[i].name() == name is
+                self._entries[i] = TreeEntry::new(mode, kind, id, name)
+                found = true
+            end
+            i += 1
+        end
+        if !found is
+            self._entries.push(TreeEntry::new(mode, kind, id, name))
+        end
+    end
+
+    fn remove(self, name: string) is
+        let mut kept: [TreeEntry] = []
+        let mut i: int = 0
+        while i < self._entries.len() is
+            if self._entries[i].name() != name is kept.push(self._entries[i]) end
+            i += 1
+        end
+        self._entries = kept
+    end
+
+    fn get(self, name: string) -> TreeEntry? is
+        let mut i: int = 0
+        while i < self._entries.len() is
+            if self._entries[i].name() == name is return self._entries[i] end
+            i += 1
+        end
+        return nil
+    end
+
+    fn write(self, git_dir: string) -> oid::Oid is
+        return create(git_dir, self._entries)
+    end
+end
