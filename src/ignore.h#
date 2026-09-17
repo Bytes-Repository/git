@@ -1,0 +1,102 @@
+mod error
+
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+
+pub struct IgnoreRules is
+    pub _patterns: [string]
+end
+
+impl IgnoreRules is
+    fn patterns(self) -> [string] is return self._patterns end
+end
+
+;; Always-ignored, regardless of any `.gitignore` content — hgit's own
+;; metadata directory.
+fn builtin_patterns() -> [string] is
+    return [".git", ".git/"]
+end
+
+;; Load `.gitignore` from a repository's working directory, if present.
+pub fn load(work_dir: string) -> IgnoreRules is
+    let mut patterns: [string] = builtin_patterns()
+    let p: string = path::join(work_dir, ".gitignore")
+    if fs::is_file(p) is
+        let lines: [string] = str::split(fs::read(p), "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let line: string = str::trim(lines[i])
+            if line.len() > 0 && !line.starts_with("#") is
+                patterns.push(line)
+            end
+            i += 1
+        end
+    end
+    return IgnoreRules { _patterns: patterns }
+end
+
+;; Whether a single glob segment pattern (may contain `*`) matches a
+;; literal segment. Supports at most one `*` per pattern, which covers
+;; the overwhelming majority of real-world `.gitignore` lines
+;; (`*.log`, `build*`, `*.o`).
+fn segment_match(pattern: string, segment: string) -> bool is
+    let star: int = str::index_of(pattern, "*")
+    if star < 0 is return pattern == segment end
+
+    let prefix: string = pattern[0..star]
+    let suffix: string = pattern[star + 1..pattern.len()]
+    if segment.len() < prefix.len() + suffix.len() is return false end
+    if prefix.len() > 0 && segment[0..prefix.len()] != prefix is return false end
+    if suffix.len() > 0 && segment[segment.len() - suffix.len()..segment.len()] != suffix is return false end
+    return true
+end
+
+fn matches_one(pattern: string, rel_path: string) -> bool is
+    let p: string = str::remove_suffix(pattern, "/")
+    ;; Directory-prefix / any-path-segment match: "build" ignores
+    ;; "build" itself and anything under "build/...".
+    if rel_path == p || rel_path.starts_with(p + "/") is return true end
+
+    ;; Otherwise treat the pattern as matching against the file's own
+    ;; last path segment (the common "*.ext" case), and also the full
+    ;; relative path for patterns with no wildcard and no slash.
+    let mut last_segment: string = rel_path
+    let mut idx: int = str_last_index_of(rel_path, "/")
+    if idx >= 0 is last_segment = rel_path[idx + 1..rel_path.len()] end
+
+    return segment_match(p, last_segment)
+end
+
+fn str_last_index_of(s: string, sub: string) -> int is
+    let parts: [string] = str::split(s, sub)
+    if parts.len() <= 1 is return -1 end
+    let mut consumed: int = 0
+    let mut i: int = 0
+    while i < parts.len() - 1 is
+        consumed = consumed + parts[i].len() + sub.len()
+        i += 1
+    end
+    return consumed - sub.len()
+end
+
+pub fn is_ignored(rules: IgnoreRules, rel_path: string) -> bool is
+    let patterns: [string] = rules.patterns()
+    let mut i: int = 0
+    while i < patterns.len() is
+        if matches_one(patterns[i], rel_path) is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Filter a list of workdir-relative paths, dropping ignored ones.
+pub fn filter(rules: IgnoreRules, rel_paths: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < rel_paths.len() is
+        if !is_ignored(rules, rel_paths[i]) is out.push(rel_paths[i]) end
+        i += 1
+    end
+    return out
+end
