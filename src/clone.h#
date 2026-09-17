@@ -1,0 +1,72 @@
+mod error
+mod oid
+mod repository
+mod refs
+mod checkout
+mod object
+
+use "std -> fs"   from "fs"
+use "std -> path" from "path"
+
+fn copy_all_objects(src_git_dir: string, dst_git_dir: string) is
+    let src_objects: string = path::join(src_git_dir, "objects")
+    if !fs::is_dir(src_objects) is return end
+    let files: [string] = fs::walk(src_objects)
+    let mut i: int = 0
+    while i < files.len() is
+        if fs::is_file(files[i]) is
+            let rel: string = files[i][src_objects.len() + 1..files[i].len()]
+            let dst: string = path::join(dst_git_dir, "objects/" + rel)
+            fs::mkdir(path::parent(dst))
+            fs::copy(files[i], dst)
+        end
+        i += 1
+    end
+end
+
+fn copy_all_refs(src_git_dir: string, dst_git_dir: string) is
+    let src_refs: string = path::join(src_git_dir, "refs")
+    if !fs::is_dir(src_refs) is return end
+    let files: [string] = fs::walk(src_refs)
+    let mut i: int = 0
+    while i < files.len() is
+        if fs::is_file(files[i]) is
+            let rel: string = files[i][src_refs.len() + 1..files[i].len()]
+            let dst: string = path::join(dst_git_dir, "refs/" + rel)
+            fs::mkdir(path::parent(dst))
+            fs::copy(files[i], dst)
+        end
+        i += 1
+    end
+end
+
+;; Clone the repository at `src_dir` into a brand-new working directory
+;; at `dst_dir`, then check out whatever branch its HEAD points at.
+pub fn clone(src_dir: string, dst_dir: string) -> error::GitResult<repository::Repository> is
+    match repository::open(src_dir) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(src_repo) => is
+            if fs::exists(dst_dir) is
+                return error::GitResult::Err(error::exists(dst_dir))
+            end
+
+            match repository::init(dst_dir, false) is
+                error::GitResult::Err(e2) => error::GitResult::Err(e2)
+                error::GitResult::Ok(dst_repo) => is
+                    ;; the fresh `init()` already wrote a HEAD/refs/objects
+                    ;; scaffold; overwrite it with the source's history.
+                    copy_all_objects(src_repo.path(), dst_repo.path())
+                    copy_all_refs(src_repo.path(), dst_repo.path())
+                    fs::copy(path::join(src_repo.path(), "HEAD"), path::join(dst_repo.path(), "HEAD"))
+
+                    let branch = refs::head_branch(dst_repo.path())
+                    if branch != nil is
+                        let co = checkout::checkout_branch(dst_repo.path(), dst_repo.workdir(), branch)
+                        if error::is_err(co) is return error::GitResult::Err(error::unwrap_err(co)) end
+                    end
+                    return error::GitResult::Ok(dst_repo)
+                end
+            end
+        end
+    end
+end
