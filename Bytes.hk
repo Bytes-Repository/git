@@ -1,1 +1,14 @@
+[package]
+-> name        => git
+-> version     => 0.1.0
+-> description => A Git implementation written 100% in H# — the H# analogue of Rust's git2
+-> author      => Bytes Developers
+-> license     => MIT
 
+[build]
+-> lang   => h#
+-> entry  => src/lib.h#
+-> output => build/libhgit
+-> emit   => lib
+
+[deps]
