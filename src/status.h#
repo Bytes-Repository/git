@@ -1,0 +1,157 @@
+mod error
+mod oid
+mod object
+mod tree
+mod index
+mod refs
+mod commit
+mod ignore
+
+use "std -> fs"      from "fs"
+use "std -> path"    from "path"
+use "std -> strings" from "str"
+
+pub enum EntryStatus is
+    NewInIndex        ;; staged, not in HEAD                 ("A ", staged add)
+    ModifiedInIndex   ;; staged, differs from HEAD            ("M ", staged modify)
+    DeletedInIndex    ;; in HEAD, missing from the index      ("D ", staged delete)
+    NewInWorkdir       ;; untracked file on disk               ("??")
+    ModifiedInWorkdir  ;; tracked, differs from the index      (" M", unstaged modify)
+    DeletedInWorkdir   ;; in the index, missing on disk        (" D", unstaged delete)
+end
+
+pub fn status_label(s: EntryStatus) -> string is
+    match s is
+        EntryStatus::NewInIndex       => "A "
+        EntryStatus::ModifiedInIndex  => "M "
+        EntryStatus::DeletedInIndex   => "D "
+        EntryStatus::NewInWorkdir     => "??"
+        EntryStatus::ModifiedInWorkdir => " M"
+        EntryStatus::DeletedInWorkdir  => " D"
+    end
+end
+
+pub struct StatusEntry is
+    pub _path:   string
+    pub _status: EntryStatus
+end
+
+impl StatusEntry is
+    fn path(self)   -> string       is return self._path end
+    fn status(self) -> EntryStatus  is return self._status end
+    fn to_line(self) -> string is
+        return status_label(self._status) + " " + self._path
+    end
+end
+
+;; HEAD tree (or the zero id, for a brand-new repository with no
+;; commits yet) vs. the index.
+fn head_tree(git_dir: string) -> oid::Oid is
+    match refs::head_oid(git_dir) is
+        error::GitResult::Err(_) => oid::zero()
+        error::GitResult::Ok(head_commit) => is
+            match commit::lookup(git_dir, head_commit) is
+                error::GitResult::Ok(c) => c.tree_id()
+                error::GitResult::Err(_) => oid::zero()
+            end
+        end
+    end
+end
+
+fn contains_str(arr: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < arr.len() is
+        if arr[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Full status: staged changes (HEAD vs. index) + unstaged changes
+;; (index vs. working directory) + untracked files, in that order.
+pub fn status(git_dir: string, work_dir: string) -> error::GitResult<[StatusEntry]> is
+    let idx: index::Index = index::read(git_dir)
+    let head_id: oid::Oid = head_tree(git_dir)
+
+    let mut out: [StatusEntry] = []
+
+    ;; HEAD -> index
+    let mut head_entries: index::Index = index::Index::new()
+    if !head_id.is_zero() is
+        match index::read_tree(git_dir, head_id) is
+            error::GitResult::Err(e) => return error::GitResult::Err(e)
+            error::GitResult::Ok(h)  => head_entries = h
+        end
+    end
+
+    let idx_entries: [index::IndexEntry] = idx.entries()
+    let head_list: [index::IndexEntry] = head_entries.entries()
+
+    let mut ii: int = 0
+    while ii < idx_entries.len() is
+        let p: string = idx_entries[ii].path()
+        let in_head = find_index_entry(head_list, p)
+        if in_head == nil is
+            out.push(StatusEntry { _path: p, _status: EntryStatus::NewInIndex })
+        else if !in_head.id().eq(idx_entries[ii].id()) is
+            out.push(StatusEntry { _path: p, _status: EntryStatus::ModifiedInIndex })
+        end
+        ii += 1
+    end
+    let mut hi: int = 0
+    while hi < head_list.len() is
+        let p: string = head_list[hi].path()
+        if find_index_entry(idx_entries, p) == nil is
+            out.push(StatusEntry { _path: p, _status: EntryStatus::DeletedInIndex })
+        end
+        hi += 1
+    end
+
+    ;; index -> working directory
+    let mut tracked: [string] = []
+    let mut wi: int = 0
+    while wi < idx_entries.len() is
+        let p: string = idx_entries[wi].path()
+        tracked.push(p)
+        let full: string = path::join(work_dir, p)
+        if !fs::is_file(full) is
+            out.push(StatusEntry { _path: p, _status: EntryStatus::DeletedInWorkdir })
+        else is
+            let content: string = fs::read(full)
+            let disk_id: oid::Oid = object::hash(object::ObjectType::Blob, content)
+            if !disk_id.eq(idx_entries[wi].id()) is
+                out.push(StatusEntry { _path: p, _status: EntryStatus::ModifiedInWorkdir })
+            end
+        end
+        wi += 1
+    end
+
+    ;; untracked
+    let rules: ignore::IgnoreRules = ignore::load(work_dir)
+    if fs::is_dir(work_dir) is
+        let files: [string] = fs::walk(work_dir)
+        let mut fi: int = 0
+        while fi < files.len() is
+            let rel: string = files[fi][work_dir.len() + 1..files[fi].len()]
+            if !contains_str(tracked, rel) && !ignore::is_ignored(rules, rel) is
+                out.push(StatusEntry { _path: rel, _status: EntryStatus::NewInWorkdir })
+            end
+            fi += 1
+        end
+    end
+
+    return error::GitResult::Ok(out)
+end
+
+fn find_index_entry(entries: [index::IndexEntry], p: string) -> index::IndexEntry? is
+    let mut i: int = 0
+    while i < entries.len() is
+        if entries[i].path() == p is return entries[i] end
+        i += 1
+    end
+    return nil
+end
+
+pub fn is_clean(entries: [StatusEntry]) -> bool is
+    return entries.len() == 0
+end
