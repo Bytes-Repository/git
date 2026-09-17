@@ -1,0 +1,94 @@
+use "std -> crypto"  from "crypto"
+use "std -> strings" from "str"
+
+;; H# v0.9 has no top-level `const`; a zero-arg fn is the established
+;; stand-in used throughout the H# stdlib for compile-time-ish constants.
+pub fn hex_len() -> int is return 40 end
+
+pub struct Oid is
+    pub _hex: string
+end
+
+impl Oid is
+    ;; Build an `Oid` from a full 40-char hex string. Does not validate —
+    ;; use `from_hex` at any boundary that takes untrusted input (user
+    ;; input, ref files, tree entries read off disk).
+    fn new(hex: string) -> Oid is
+        return Oid { _hex: str::to_lower(hex) }
+    end
+
+    fn hex(self) -> string is return self._hex end
+    fn to_string(self) -> string is return self._hex end
+
+    ;; First 7 hex chars — what `git log --oneline` shows.
+    fn short(self) -> string is
+        return self.short_len(7)
+    end
+
+    fn short_len(self, n: int) -> string is
+        if n >= self._hex.len() is return self._hex end
+        return self._hex[0..n]
+    end
+
+    fn is_zero(self) -> bool is
+        return self._hex == zero_hex()
+    end
+
+    fn eq(self, other: Oid) -> bool is
+        return self._hex == other.hex()
+    end
+end
+
+fn zero_hex() -> string is
+    return "0000000000000000000000000000000000000000"
+end
+
+;; The all-zero id — used the same way git uses it: "no parent",
+;; "ref does not resolve to anything yet", etc.
+pub fn zero() -> Oid is
+    return Oid::new(zero_hex())
+end
+
+fn is_hex_char(c: string) -> bool is
+    return (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+end
+
+pub fn is_valid_hex(hex: string) -> bool is
+    if hex.len() != hex_len() is return false end
+    let mut i: int = 0
+    while i < hex.len() is
+        if !is_hex_char(hex[i..i + 1]) is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Parse untrusted text into an `Oid`. Returns nil rather than a partially
+;; valid id, so callers can `let id = oid::from_hex(s)?` the same way the
+;; rest of H#'s own stdlib short-circuits on a bad parse.
+pub fn from_hex(hex: string) -> Oid? is
+    let trimmed: string = str::trim(hex)
+    if !is_valid_hex(trimmed) is return nil end
+    return Oid::new(trimmed)
+end
+
+;; Content-address arbitrary bytes the same way Git addresses an object:
+;; SHA-1 of the exact string handed in (the caller — see `object.h#` —
+;; is responsible for building the "<type> <len>\n<payload>" framing
+;; before calling this).
+pub fn hash(content: string) -> Oid is
+    return Oid::new(crypto::sha1(content))
+end
+
+;; Whether `s` looks like an abbreviated oid prefix (used by revparse-style
+;; lookups elsewhere in the library): 4..40 hex characters.
+pub fn is_valid_prefix(s: string) -> bool is
+    let n: int = s.len()
+    if n < 4 || n > hex_len() is return false end
+    let mut i: int = 0
+    while i < n is
+        if !is_hex_char(s[i..i + 1]) is return false end
+        i += 1
+    end
+    return true
+end
