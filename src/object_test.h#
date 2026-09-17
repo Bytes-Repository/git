@@ -1,0 +1,128 @@
+use "std -> test" from "test"
+use "std -> fs"   from "fs"
+
+mod error
+mod oid
+mod object
+mod blob
+mod tree
+mod commit
+mod signature
+
+fn fresh_dir(name: string) -> string is
+    let d: string = "/tmp/hgit_test_" + name
+    if fs::exists(d) is fs::rmdir_all(d) end
+    fs::mkdir(d)
+    return d
+end
+
+#[test]
+fn test_blob_roundtrip() is
+    let git_dir = fresh_dir("blob_roundtrip")
+    let id = blob::create(git_dir, "hello, hgit!")
+    let result = blob::lookup(git_dir, id)
+    assert_true(error::is_ok(result))
+    match result is
+        error::GitResult::Ok(b) => is
+            assert_eq(b.content(), "hello, hgit!")
+            assert_eq(b.size(), 12)
+        end
+        error::GitResult::Err(_) => fail("expected Ok")
+    end
+end
+
+#[test]
+fn test_blob_dedup() is
+    let git_dir = fresh_dir("blob_dedup")
+    let a = blob::create(git_dir, "same content")
+    let b = blob::create(git_dir, "same content")
+    assert_eq(a.hex(), b.hex())
+end
+
+#[test]
+fn test_wrong_type_lookup_errors() is
+    let git_dir = fresh_dir("wrong_type")
+    let id = blob::create(git_dir, "just a blob")
+    let result = commit::lookup(git_dir, id)
+    assert_true(error::is_err(result))
+end
+
+#[test]
+fn test_tree_roundtrip() is
+    let git_dir = fresh_dir("tree_roundtrip")
+    let a = blob::create(git_dir, "A")
+    let b = blob::create(git_dir, "B")
+    let mut builder = tree::TreeBuilder::new()
+    builder.insert(tree::mode_file(), object::ObjectType::Blob, a, "a.txt")
+    builder.insert(tree::mode_file(), object::ObjectType::Blob, b, "b.txt")
+    let tree_id = builder.write(git_dir)
+
+    let result = tree::lookup(git_dir, tree_id)
+    assert_true(error::is_ok(result))
+    match result is
+        error::GitResult::Ok(t) => is
+            assert_eq(t.len(), 2)
+            let entry = t.get("a.txt")
+            assert_not_nil(entry)
+            assert_eq(entry.id().hex(), a.hex())
+        end
+        error::GitResult::Err(_) => fail("expected Ok")
+    end
+end
+
+#[test]
+fn test_tree_same_entries_same_id() is
+    let git_dir = fresh_dir("tree_stable_hash")
+    let a = blob::create(git_dir, "A")
+    let mut b1 = tree::TreeBuilder::new()
+    b1.insert(tree::mode_file(), object::ObjectType::Blob, a, "a.txt")
+    let mut b2 = tree::TreeBuilder::new()
+    b2.insert(tree::mode_file(), object::ObjectType::Blob, a, "a.txt")
+    assert_eq(b1.write(git_dir).hex(), b2.write(git_dir).hex())
+end
+
+#[test]
+fn test_commit_roundtrip() is
+    let git_dir = fresh_dir("commit_roundtrip")
+    let blob_id = blob::create(git_dir, "content")
+    let mut builder = tree::TreeBuilder::new()
+    builder.insert(tree::mode_file(), object::ObjectType::Blob, blob_id, "file.txt")
+    let tree_id = builder.write(git_dir)
+
+    let sig = signature::Signature::new("Test User", "test@example.com", 1700000000, 60)
+    let no_parents: [oid::Oid] = []
+    let commit_id = commit::create(git_dir, tree_id, no_parents, sig, sig, "Initial commit\n\nBody text.")
+
+    let result = commit::lookup(git_dir, commit_id)
+    assert_true(error::is_ok(result))
+    match result is
+        error::GitResult::Ok(c) => is
+            assert_eq(c.tree_id().hex(), tree_id.hex())
+            assert_true(c.is_root())
+            assert_false(c.is_merge())
+            assert_eq(c.summary(), "Initial commit")
+            assert_eq(c.author().name(), "Test User")
+            assert_eq(c.author().email(), "test@example.com")
+        end
+        error::GitResult::Err(_) => fail("expected Ok")
+    end
+end
+
+#[test]
+fn test_commit_with_parent() is
+    let git_dir = fresh_dir("commit_with_parent")
+    let t1 = tree::TreeBuilder::new().write(git_dir)
+    let sig = signature::Signature::new("A", "a@example.com", 1700000000, 0)
+    let no_parents: [oid::Oid] = []
+    let c1 = commit::create(git_dir, t1, no_parents, sig, sig, "first")
+    let parents: [oid::Oid] = [c1]
+    let c2 = commit::create(git_dir, t1, parents, sig, sig, "second")
+
+    match commit::lookup(git_dir, c2) is
+        error::GitResult::Ok(c) => is
+            assert_eq(c.parent_count(), 1)
+            assert_eq(c.parent_id(0).hex(), c1.hex())
+        end
+        error::GitResult::Err(_) => fail("expected Ok")
+    end
+end
