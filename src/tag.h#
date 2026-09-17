@@ -1,0 +1,123 @@
+mod error
+mod oid
+mod object
+mod signature
+
+use "std -> strings" from "str"
+
+pub struct Tag is
+    pub _oid:     oid::Oid
+    pub _target:  oid::Oid
+    pub _target_kind: object::ObjectType
+    pub _name:    string
+    pub _tagger:  signature::Signature
+    pub _message: string
+end
+
+impl Tag is
+    fn id(self)          -> oid::Oid            is return self._oid end
+    fn target_id(self)   -> oid::Oid             is return self._target end
+    fn target_kind(self) -> object::ObjectType   is return self._target_kind end
+    fn name(self)        -> string               is return self._name end
+    fn tagger(self)      -> signature::Signature is return self._tagger end
+    fn message(self)     -> string               is return self._message end
+end
+
+fn serialize(target: oid::Oid, target_kind: object::ObjectType, name: string,
+             tagger: signature::Signature, message: string) -> string is
+    let mut out: string = "object " + target.hex() + "\n"
+    out = out + "type " + object::type_name(target_kind) + "\n"
+    out = out + "tag " + name + "\n"
+    out = out + "tagger " + tagger.to_line() + "\n"
+    out = out + "\n" + message
+    return out
+end
+
+pub fn parse(data: string) -> error::GitResult<Tag> is
+    let lines: [string] = str::split(data, "\n")
+
+    let mut target: oid::Oid = oid::zero()
+    let mut have_target: bool = false
+    let mut target_kind: object::ObjectType = object::ObjectType::Unknown
+    let mut name: string = ""
+    let mut tagger: signature::Signature = signature::Signature::now("", "")
+    let mut have_tagger: bool = false
+
+    let mut i: int = 0
+    let mut header_lines: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        if line.len() == 0 is
+            header_lines = i + 1
+            i = lines.len()
+        else is
+            if line.len() > 7 && line[0..7] == "object " is
+                let t = oid::from_hex(line[7..line.len()])
+                if t != nil is
+                    target = t
+                    have_target = true
+                end
+            else if line.len() > 5 && line[0..5] == "type " is
+                target_kind = object::type_from_name(line[5..line.len()])
+            else if line.len() > 4 && line[0..4] == "tag " is
+                name = line[4..line.len()]
+            else if line.len() > 7 && line[0..7] == "tagger " is
+                let s = signature::parse_line(line[7..line.len()])
+                if s != nil is
+                    tagger = s
+                    have_tagger = true
+                end
+            end
+            i += 1
+        end
+    end
+
+    if !have_target || !have_tagger || name.len() == 0 is
+        return error::GitResult::Err(error::corrupt("tag is missing object/tag/tagger"))
+    end
+
+    let mut message: string = ""
+    if header_lines > 0 && header_lines <= lines.len() is
+        let mut rest: [string] = []
+        let mut j: int = header_lines
+        while j < lines.len() is
+            rest.push(lines[j])
+            j += 1
+        end
+        message = str::join(rest, "\n")
+    end
+
+    return error::GitResult::Ok(Tag {
+        _oid: oid::zero(), _target: target, _target_kind: target_kind,
+        _name: name, _tagger: tagger, _message: message,
+    })
+end
+
+;; Write a new annotated tag object — does not by itself create the
+;; `refs/tags/<name>` ref; see `branch.h#`'s `tag_annotated` for the
+;; convenience that does both, mirroring git2's `Repository::tag()`.
+pub fn create(git_dir: string, target: oid::Oid, target_kind: object::ObjectType,
+              name: string, tagger: signature::Signature, message: string) -> oid::Oid is
+    let data: string = serialize(target, target_kind, name, tagger, message)
+    return object::write(git_dir, object::ObjectType::Tag, data)
+end
+
+pub fn lookup(git_dir: string, id: oid::Oid) -> error::GitResult<Tag> is
+    match object::read(git_dir, id) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(raw) => is
+            if !object::type_eq(raw.kind(), object::ObjectType::Tag) is
+                return error::GitResult::Err(error::invalid(id.hex() + " is not a tag"))
+            end
+            match parse(raw.data()) is
+                error::GitResult::Err(e) => error::GitResult::Err(e)
+                error::GitResult::Ok(t)  => is
+                    return error::GitResult::Ok(Tag {
+                        _oid: id, _target: t.target_id(), _target_kind: t.target_kind(),
+                        _name: t.name(), _tagger: t.tagger(), _message: t.message(),
+                    })
+                end
+            end
+        end
+    end
+end
