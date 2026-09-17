@@ -1,0 +1,42 @@
+mod error
+mod oid
+mod commit
+mod refs
+mod index
+mod checkout
+
+pub enum ResetMode is
+    Soft    ;; move HEAD's branch only
+    Mixed   ;; + reset the index to match the target commit
+    Hard    ;; + reset the working directory to match, discarding local changes
+end
+
+pub fn reset(git_dir: string, work_dir: string, target: oid::Oid, mode: ResetMode) -> error::GitResult<bool> is
+    match commit::lookup(git_dir, target) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(c)  => is
+            let branch = refs::head_branch(git_dir)
+            if branch != nil is
+                refs::write_direct(git_dir, refs::branch_ref_name(branch), target)
+            else is
+                refs::set_head_detached(git_dir, target)
+            end
+
+            match mode is
+                ResetMode::Soft => return error::GitResult::Ok(true)
+                ResetMode::Mixed => is
+                    match index::read_tree(git_dir, c.tree_id()) is
+                        error::GitResult::Err(e2) => return error::GitResult::Err(e2)
+                        error::GitResult::Ok(idx) => is
+                            index::write(git_dir, idx)
+                            return error::GitResult::Ok(true)
+                        end
+                    end
+                end
+                ResetMode::Hard => is
+                    return checkout::checkout_commit(git_dir, work_dir, target)
+                end
+            end
+        end
+    end
+end
