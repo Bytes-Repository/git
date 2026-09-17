@@ -1,0 +1,146 @@
+mod error
+mod oid
+mod refs
+mod commit
+mod tag
+mod signature
+mod object
+
+use "std -> strings" from "str"
+
+pub struct BranchInfo is
+    pub _name:   string
+    pub _target: oid::Oid
+    pub _is_head: bool
+end
+
+impl BranchInfo is
+    fn name(self)   -> string  is return self._name end
+    fn target(self) -> oid::Oid is return self._target end
+    fn is_head(self) -> bool   is return self._is_head end
+end
+
+;; Create a branch pointing at `target`. Mirrors `Repository::branch()`.
+pub fn create(git_dir: string, name: string, target: oid::Oid) -> error::GitResult<BranchInfo> is
+    let full: string = refs::branch_ref_name(name)
+    if refs::exists(git_dir, full) is
+        return error::GitResult::Err(error::exists("branch " + name))
+    end
+    refs::write_direct(git_dir, full, target)
+    return error::GitResult::Ok(BranchInfo { _name: name, _target: target, _is_head: false })
+end
+
+pub fn delete(git_dir: string, name: string) -> error::GitResult<bool> is
+    let full: string = refs::branch_ref_name(name)
+    if !refs::exists(git_dir, full) is
+        return error::GitResult::Err(error::not_found("branch " + name))
+    end
+    let current = refs::head_branch(git_dir)
+    if current != nil && current == name is
+        return error::GitResult::Err(error::conflict("cannot delete the currently checked-out branch"))
+    end
+    refs::delete(git_dir, full)
+    return error::GitResult::Ok(true)
+end
+
+pub fn rename(git_dir: string, old_name: string, new_name: string) -> error::GitResult<bool> is
+    match refs::resolve(git_dir, refs::branch_ref_name(old_name)) is
+        error::GitResult::Err(e) => error::GitResult::Err(e)
+        error::GitResult::Ok(id) => is
+            if refs::exists(git_dir, refs::branch_ref_name(new_name)) is
+                return error::GitResult::Err(error::exists("branch " + new_name))
+            end
+            refs::write_direct(git_dir, refs::branch_ref_name(new_name), id)
+            refs::delete(git_dir, refs::branch_ref_name(old_name))
+            let current = refs::head_branch(git_dir)
+            if current != nil && current == old_name is
+                refs::set_head_to_branch(git_dir, new_name)
+            end
+            return error::GitResult::Ok(true)
+        end
+    end
+end
+
+;; List every local branch. Mirrors `Repository::branches()`.
+pub fn list(git_dir: string) -> [BranchInfo] is
+    let names: [string] = refs::list(git_dir, "refs/heads")
+    let current = refs::head_branch(git_dir)
+    let mut out: [BranchInfo] = []
+    let mut i: int = 0
+    while i < names.len() is
+        match refs::resolve(git_dir, names[i]) is
+            error::GitResult::Ok(id) => is
+                let short: string = refs::shorthand_of(names[i])
+                let is_head: bool = current != nil && current == short
+                out.push(BranchInfo { _name: short, _target: id, _is_head: is_head })
+            end
+            error::GitResult::Err(_) => is end
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn exists(git_dir: string, name: string) -> bool is
+    return refs::exists(git_dir, refs::branch_ref_name(name))
+end
+
+;; Move HEAD to point at `name` (a branch). This is the ref-only half of
+;; a checkout — pair it with `checkout::checkout_tree` to also update
+;; the working directory and index, or use `checkout::checkout_branch`
+;; which does both in one call, mirroring
+;; `Repository::set_head()` + `checkout_head()` in git2.
+pub fn set_head(git_dir: string, name: string) -> error::GitResult<bool> is
+    if !exists(git_dir, name) is
+        return error::GitResult::Err(error::not_found("branch " + name))
+    end
+    refs::set_head_to_branch(git_dir, name)
+    return error::GitResult::Ok(true)
+end
+
+;; ── Tags ─────────────────────────────────────────────────────────────────
+
+;; A lightweight tag: just a ref, no tag object. Mirrors
+;; `Repository::tag_lightweight()`.
+pub fn tag_lightweight(git_dir: string, name: string, target: oid::Oid) -> error::GitResult<bool> is
+    let full: string = refs::tag_ref_name(name)
+    if refs::exists(git_dir, full) is
+        return error::GitResult::Err(error::exists("tag " + name))
+    end
+    refs::write_direct(git_dir, full, target)
+    return error::GitResult::Ok(true)
+end
+
+;; An annotated tag: writes a real `tag` object, then points
+;; `refs/tags/<name>` at it. Mirrors `Repository::tag()`.
+pub fn tag_annotated(git_dir: string, name: string, target: oid::Oid,
+                      target_kind: object::ObjectType, tagger: signature::Signature,
+                      message: string) -> error::GitResult<oid::Oid> is
+    let full: string = refs::tag_ref_name(name)
+    if refs::exists(git_dir, full) is
+        return error::GitResult::Err(error::exists("tag " + name))
+    end
+    let tag_oid: oid::Oid = tag::create(git_dir, target, target_kind, name, tagger, message)
+    refs::write_direct(git_dir, full, tag_oid)
+    return error::GitResult::Ok(tag_oid)
+end
+
+pub fn tag_delete(git_dir: string, name: string) -> error::GitResult<bool> is
+    let full: string = refs::tag_ref_name(name)
+    if !refs::exists(git_dir, full) is
+        return error::GitResult::Err(error::not_found("tag " + name))
+    end
+    refs::delete(git_dir, full)
+    return error::GitResult::Ok(true)
+end
+
+pub fn tag_list(git_dir: string) -> [string] is
+    let names: [string] = refs::list(git_dir, "refs/tags")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        out.push(refs::shorthand_of(names[i]))
+        i += 1
+    end
+    return out
+end
